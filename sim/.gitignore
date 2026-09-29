@@ -1,0 +1,3 @@
+# 仿真源文件和 Makefile 纳入版本控制；仅忽略本地生成物。
+/build/
+/results/

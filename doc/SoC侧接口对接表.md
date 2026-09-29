@@ -1,5 +1,7 @@
 # SoC 侧接口对接表
 
+适用范围：本文描述保留的 **SystemC 行为模型**。新增 RTL 顶层 `axi2flit_soc` 的独立 `s_axi_*` 信号接口、参数及限制见 [RTL 设计与接口说明第 4 节](RTL协议桥设计与接口说明.md#4-soc-侧axi2flit_soc-的完整-axi-接口)，不要将 C++ 通道对象直接绑定为 RTL 端口。
+
 本文供主机模型、AXI 激励和 trace 回放器开发者使用，描述当前可以连接的接口。实现定义见 [axi2flit.h](../systemc/include/axi2flit.h)、[axi_if.h](../systemc/include/axi_if.h)，已有接线与监视器见 [tb_full_link.cpp](../systemc/tb/tb_full_link.cpp)。
 
 **当前 SoC 边界是 `Axi2Flit` 的 AXI 从机端口。** TLM socket、gem5 Packet、Vortex 原生请求和 trace 文件都不能直接绑定这些端口，需要主机侧适配器。相关适配器尚未实现，开发方案见[全链路联合仿真接入指南](全链路联合仿真接入指南.md)。

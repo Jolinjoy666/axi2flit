@@ -1,6 +1,8 @@
 # AXI2FLIT
 
-AXI2FLIT 是使用 C++17 和 SystemC 实现的双向协议桥及联合仿真环境。桥将 SoC 的 AXI 请求编码为固定字节格式的消息，经 UCIe 行为链路送到存储侧响应端；响应端访问存储后，将状态和读数据送回 AXI B/R 通道。
+AXI2FLIT 包含 C++17/SystemC 行为参考模型、SystemVerilog RTL 协议桥及验证环境。桥将 SoC 的 AXI 请求编码为固定字节格式的消息，送到存储侧响应端；响应端访问存储后，将状态和读数据送回 AXI B/R 通道。
+
+以下为已接入 UCIe 的 SystemC 路径；新增 RTL 使用同一消息格式，当前通过有限 Flit FIFO 与逐拍 MC 测试后端闭环，尚未接入实际 UCIe/MC 模型。
 
 ```text
 AXI 激励 ⇄ Axi2Flit ⇄ UcieAouAdapter ⇄ UcieLink ⇄ AouTarget ⇄ SimpleBurstMemory
@@ -15,7 +17,7 @@ AXI 激励 ⇄ Axi2Flit ⇄ UcieAouAdapter ⇄ UcieLink ⇄ AouTarget ⇄ Simple
 - 存储侧：整笔突发请求/响应 FIFO。简单内存保存实际字节数据，支持读写、掩码和错误响应。
 - 全链路：实例化 UcieLink，包含链路训练、行为物理层、CRC 和重放；生成 AXI 波形、事务记录和自动检查结果。
 
-这是时钟驱动桥、事件驱动链路和事务级存储的联合行为仿真。项目不包含 RTL 实现、DRAM 引脚时序、独占访问执行、原子操作或运行期间单端热复位。链路帧头和 CRC 的具体行为见字节格式文档。
+上述为时钟驱动桥、事件驱动链路和事务级存储的联合行为仿真。新增 RTL 位于 `rtl/`：SoC 侧为 AXI 从机，存储侧输出带 tag 的逐拍 MC 命令。项目仍不包含 DRAM/DFI 引脚时序、独占访问执行、原子操作或运行期间单端热复位；RTL 尚无工艺综合/时序签核证据，不能沿用 SystemC 性能数值宣布达标。链路帧头和 CRC 的具体行为见字节格式文档。
 
 ## 主机与存储接入入口
 
@@ -24,6 +26,7 @@ AXI 激励 ⇄ Axi2Flit ⇄ UcieAouAdapter ⇄ UcieLink ⇄ AouTarget ⇄ Simple
 | SoC/主机开发者 | `Axi2Flit` 的 AXI 从机端口：AW/W/AR 输入，B/R 输出 | [SoC 侧接口对接表](doc/SoC侧接口对接表.md) |
 | 存储开发者 | `AouTarget.mem_req/mem_rsp`，整突发 `SimpleMemRequest/Response` FIFO | [存储侧接口对接表第 1～3 节](doc/存储侧接口对接表.md) |
 | 联合仿真顶层开发者 | 参考 `tb_full_link.cpp` 装配模块和监视器 | [联仿交接约定](doc/全链路联合仿真接入指南.md#11-联仿交接约定) |
+| RTL SoC/MC 开发者 | `axi2flit_soc.s_axi_*`；`flit2mc_target.mc_req_*/mc_rsp_*` | [RTL 设计与接口说明](doc/RTL协议桥设计与接口说明.md) |
 
 gem5/Vortex/Ramulator 适配器、trace 文件回放器和独立的统一链路顶层尚未实现。文档中的精简存储接口属于可选设计方案，不能直接替代当前头文件；首轮集成使用现有类型，后端不匹配的部分由包装层转换。Adapter 是桥到 UCIe 的内部适配，不是主机接口。
 
@@ -58,6 +61,16 @@ make SYSTEMC_HOME=/work/systemc UCIE_DIR=/work/models/ucie-model preflight
 
 产物位于 `systemc/sim/`。`perf_report.txt` 是简化链路下的桥性能报告；`full_link_*.log/.csv/.vcd` 是全链路功能结果。性能报告不能代替全链路持续带宽测量。
 
+RTL 独立入口需要 Verilator（本次验证为 5.052）及上述 SystemC 库，后者只用于 TB 的协议字节参考：
+
+```bash
+make -C sim run WIDTH=256 RP=1       # RTL 闭环功能、时延与复位
+make -C sim check                    # FIFO、9 配置功能/异常、三位宽性能、记分板负向控制
+make -C sim run ARGS=--trace          # 生成 sim/results/*.vcd
+```
+
+RTL 构建位于 `sim/build/`，日志及波形位于 `sim/results/`。MC 接口语义、测试覆盖和实测性能见下列 RTL 文档；RTL 当前持续吞吐尚未达到 90% 时间利用率要求。
+
 ## 目录与文档
 
 | 路径 | 内容 |
@@ -67,12 +80,19 @@ make SYSTEMC_HOME=/work/systemc UCIE_DIR=/work/models/ucie-model preflight
 | `systemc/tb/` | 桥、组件、性能和全链路测试 |
 | `systemc/scripts/` | 波形页面生成工具 |
 | `systemc/sim/` | 可再生的构建与仿真产物 |
+| `rtl/` | SoC 桥、MC 响应端及公共协议/credit/FIFO RTL |
+| `sim/tb/`、`sim/Makefile` | RTL 测试顶层、独立记分板、仿真入口 |
+
+- [RTL 设计与接口说明](doc/RTL协议桥设计与接口说明.md)：完整 AXI/Flit/MC 端口、时序、参数和职责边界。
+- [RTL 验证说明](doc/RTL协议桥验证说明.md)：复现命令、覆盖、正确性判据、延迟和吞吐结果。
+- [研究成果 2 验收对照](doc/研究成果2验收对照与指标计算说明.md)：行为/RTL 证据与实际 MC/DFI 剩余工作。
 
 - [设计文档](systemc/doc/design.md)：模块职责、握手、容量和顺序规则。
 - [字节格式与接口](systemc/doc/wire_contract.md)：消息、帧头、物理布局和接线约定。
 - [SoC 侧接口对接表](doc/SoC侧接口对接表.md)：端口方向、字段、窄访问、握手和主机接入职责。
 - [存储侧接口对接表](doc/存储侧接口对接表.md)：请求/响应字段、功能、单 RP 简化及外部存储模型映射。
 - [验证文档](systemc/doc/verification.md)：测试范围、判据、性能口径和验证边界。
+- [端到端延迟、带宽与 credit 容量分析](doc/端到端延迟、带宽与credit容量分析.md)：实际时延分解、速率配置、BDP、缓冲预算与持续负载实测。
 - [全链路使用说明](doc/UCIe全链路仿真计划与使用.md)：场景配置、产物和波形判读。
 - [全链路联合仿真接入指南](doc/全链路联合仿真接入指南.md)：现有接口、gem5/Vortex/Ramulator 适配、时间同步及验收计划。
 - [接入与交付说明](systemc/integration/README.md)：依赖安装和路径迁移。
