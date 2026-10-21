@@ -28,7 +28,7 @@ RTL 包含寄存器、固定深度 FIFO、组合逻辑和状态转移；数据�
 | [aou_pkg.sv](../rtl/aou_pkg.sv) | 固定类型、协议长度、字段编解码、PH 布局；纯组合函数，无寄存器 |
 | [aou_sync_fifo.sv](../rtl/aou_sync_fifo.sv) | 固定存储、读写指针、占用计数；`FWFT=0` 时空队列不旁路，`FWFT=1` 时空队列可同拍直通；满且同拍出队允许入队 |
 | [aou_flit_tx.sv](../rtl/aou_flit_tx.sv) | 消息仲裁、整消息扣 credit、跨帧续传、PH 授信；在建帧和输出帧分别保存 |
-| [aou_flit_rx.sv](../rtl/aou_flit_rx.sv) | 帧寄存器、MsgStart 扫描、跨帧消息寄存器、完整消息输出寄存器 |
+| [aou_flit_rx.sv](../rtl/aou_flit_rx.sv) | 双槽帧 FIFO、前两帧 MsgStart 扫描与拼接 MUX、完整消息输出寄存器；稳态每拍一条消息 |
 | [aou_transport.sv](../rtl/aou_transport.sv) | 组合 TX/RX；每 RP/消息类型接收 FIFO；三套 credit 账本及协议检查 |
 | [axi2flit_soc.sv](../rtl/axi2flit_soc.sv) | AXI 从机；AW/W 关联、请求缓冲、ID/RP 在途状态、B/R 返回选择 |
 | [flit2mc_target.sv](../rtl/flit2mc_target.sv) | 请求拆拍、MC 发令、固定槽位 ROB、乱序完成收集、按序退休、B 聚合 |

@@ -11,6 +11,7 @@
 #include "aou_stream_decoder.h"
 #include "msg_builder.h"
 #include "credit_manager.h"
+#include "bridge_test_config.h"
 #include <array>
 #include <deque>
 #include <map>
@@ -67,6 +68,14 @@ struct Bench {
     bool corrupt_read=false; // 仅破坏记分板期望，验证检查器确实能拒绝错误数据。
     bool aw_fire=false,w_fire=false,ar_fire=false;
     double fbudget=512,rbudget=512;
+    BridgeTestConfig config;
+    std::array<std::deque<double>,2> arrival;
+    std::array<double,2> next_launch{};
+    std::array<uint64_t,14> stalls{};
+    std::array<uint64_t,2> used_granules{}, empty_frames{};
+    std::array<unsigned,2> wire_remaining{};
+    unsigned rob_peak=0;
+    uint64_t next_mc_issue=0;
     std::string phase="initialization";
     std::vector<uint8_t> reference=std::vector<uint8_t>(MEM_BYTES),memory=std::vector<uint8_t>(MEM_BYTES);
     std::deque<WriteContext> write_context;
@@ -80,7 +89,7 @@ struct Bench {
     uint64_t ar_time=0,w_time=0,tx_time=0,rx_time=0,target_req_time=0,target_w_time=0,target_rsp_time=0;
     unsigned max_tx=0,max_rx=0,max_target=0,max_return=0;
 
-    explicit Bench(bool waves=false) {
+    explicit Bench(bool waves=false,BridgeTestConfig settings={}) : config(settings) {
         context->traceEverOn(waves);
         dut=std::make_unique<Vtb_rtl_bridge>(context.get());
         if(waves) {
@@ -193,7 +202,8 @@ struct Bench {
         require(dut->mc_req_wuser==e.wuser,"MC WUSER");
         for(const auto& r:responses) require(r.tag!=dut->mc_req_tag,"MC tag reused while outstanding");
         Response r; r.tag=dut->mc_req_tag; r.status=status(a,e.beat); r.sequence=mc_count++;
-        r.due=cycle+(stress ? 2+(mc_count*7)%23 : 2);
+        r.due=cycle+(stress ? config.mc_latency+(mc_count*7)%23 : config.mc_latency);
+        next_mc_issue=cycle+config.mc_interval;
         const unsigned size=1u<<a.size; const auto addr=dut->mc_req_addr; const unsigned lane=unsigned(addr%BYTES);
         for(unsigned j=0;j<BYTES;j++) if(e.write&&e.strb[j]&&(j<lane||j>=lane+size)) r.status=2;
         if(!r.status) for(unsigned j=0;j<size;j++) {
@@ -209,6 +219,11 @@ struct Bench {
         const bool carry=decoder[index].carry_active(); const auto parsed=decoder[index].consume(f);
         if(index<2) {
             const unsigned dir=index; if(dir==0) ++fwd_frames; else ++rev_frames;
+            if(!f.msg_start && wire_remaining[dir]==0) ++empty_frames[dir];
+            for(unsigned g=0;g<48;g++) {
+                if((f.msg_start>>g)&1) wire_remaining[dir]=unsigned(message_granules_from_header(f.payload[g*5]));
+                if(wire_remaining[dir]) { ++used_granules[dir]; --wire_remaining[dir]; }
+            }
             if(carry) ++spanning;
             decode_header_credits(f.msg_credit,TEST_RP,[&](const CreditUpdate& c) { credits[1-dir][c.rp][credit_kind_index(c.kind)]+=c.granules; });
             for(unsigned g=0;g<48;g++) if((f.msg_start>>g)&1) {
@@ -242,12 +257,21 @@ struct Bench {
     }
     void tick() {
         require(cycle<2000000,"watchdog timeout"); dut->clk=0;
-        fbudget=std::min(512.0,fbudget+96); rbudget=std::min(512.0,rbudget+96);
+        fbudget=std::min(512.0,fbudget+config.wire_gbps()*2);
+        rbudget=std::min(512.0,rbudget+config.wire_gbps()*2);
         dut->forward_enable=!block_link&&(!pace||fbudget>=256)&&(!stress||cycle%7!=0);
         dut->reverse_enable=!block_link&&(!pace||rbudget>=256)&&(!stress||cycle%5!=0);
         dut->s_axi_rready=!block_axi&&(!stress||cycle%11>=4);
         dut->s_axi_bready=!block_axi&&(!stress||cycle%13>=3);
-        dut->mc_req_ready=!block_mc&&(!stress||cycle%9>=3);
+        dut->mc_req_ready=!block_mc&&cycle>=next_mc_issue&&(!stress||cycle%9>=3);
+        dut->forward_deliver=1; dut->reverse_deliver=1;
+        if(config.physical()) {
+            // 串行发送间隔与传播流水线分别建模；延迟不会重复降低稳态带宽。
+            dut->forward_enable=!block_link && cycle*2.0+2.0+1e-9>=next_launch[0];
+            dut->reverse_enable=!block_link && cycle*2.0+2.0+1e-9>=next_launch[1];
+            dut->forward_deliver=!arrival[0].empty() && arrival[0].front()<=cycle*2.0+1e-9;
+            dut->reverse_deliver=!arrival[1].empty() && arrival[1].front()<=cycle*2.0+1e-9;
+        }
         int response=-1;
         for(unsigned i=0;i<responses.size();i++) if(responses[i].due<=cycle) {
             response=int(i); if(!stress) break;
@@ -262,11 +286,26 @@ struct Bench {
         ar_fire=dut->s_axi_arvalid&&dut->s_axi_arready;
         w_fire=dut->s_axi_wvalid&&dut->s_axi_wready;
         if(checking&&dut->rst_n&&dut->link_up) {
+            for(unsigned n=0;n<stalls.size();n++) stalls[n]+=((dut->perf_stall>>n)&1);
+            rob_peak=std::max(rob_peak,unsigned(dut->perf_rob_level));
             host_events();
             if(dut->fwd_valid&&dut->fwd_ready) { frame(0,dut->fwd_data); fbudget-=256; }
             if(dut->rev_valid&&dut->rev_ready) { frame(1,dut->rev_data); rbudget-=256; }
             if(dut->soc_rx_valid&&dut->soc_rx_ready) frame(2,dut->soc_rx_data);
             if(dut->target_rx_valid&&dut->target_rx_ready) frame(3,dut->target_rx_data);
+            if(config.physical()) {
+                if(dut->soc_rx_valid&&dut->soc_rx_ready) { require(!arrival[1].empty(),"missing reverse flight"); arrival[1].pop_front(); }
+                if(dut->target_rx_valid&&dut->target_rx_ready) { require(!arrival[0].empty(),"missing forward flight"); arrival[0].pop_front(); }
+                for(unsigned dir=0;dir<2;dir++) {
+                    const bool sent=dir ? dut->rev_valid&&dut->rev_ready : dut->fwd_valid&&dut->fwd_ready;
+                    if(sent) {
+                        // 最多提前一拍排入串行器，发送时刻不早于接受时刻，保留分数周期相位。
+                        const double launch=std::max(next_launch[dir],cycle*2.0);
+                        arrival[dir].push_back(launch+config.flight_ns());
+                        next_launch[dir]=launch+256/config.wire_gbps();
+                    }
+                }
+            }
             if(response>=0&&dut->mc_rsp_valid&&dut->mc_rsp_ready) {
                 if(measure) target_rsp_time=cycle;
                 for(unsigned i=0;i<responses.size();i++) if(responses[i].sequence<responses[response].sequence) { ++ooo; break; }
@@ -335,6 +374,7 @@ struct Bench {
         for(auto& rp:expect_cmd) for(auto& q:rp) q.clear();
         for(auto& dir:expect_msg) for(auto& rp:dir) for(auto& q:rp) q.clear();
         decoder={}; credits={};
+        arrival={}; next_launch={}; next_mc_issue=0; wire_remaining={};
         reference.assign(MEM_BYTES,0); memory.assign(MEM_BYTES,0);
         aw_count=w_count=ar_count=r_count=b_count=read_done=mc_count=0;
         block_axi=block_mc=block_link=false; stress=false; fbudget=rbudget=512;
@@ -409,36 +449,107 @@ void functional(bool waves) {
     std::cout<<"RESET PASS coordinated cancellation and fresh credit initialization\n";
 }
 
-// 持续负载基线：每个方向 48GB/s 物理预算，按 256B/帧限速；不模拟 CRC/重放。
-// 先预热，再以实际窗口长度计完成字节；写必须收到 B，不能只拿 W 接收速率充数。
-// 固定 RP0、16 拍全宽突发、MC 两拍返回。此处如未达 90% 要如实报告，不自动套用
-// SystemC 模型的性能数值。AXI 驱动也会消耗发地址的一拍，属于本基线负载条件。
-void performance() {
+// 满载测试：AW 与 W 独立推进，MC 可每拍接收/返回；等待时间不等于发起间隔。
+// baseline 保留原先逐笔发 AW 再发 W 的激励，供修改前后的同条件对比。
+void performance(const BridgeTestConfig& cfg) {
+    cfg.validate(BYTES);
     for(bool wr:{false,true}) {
-        Bench b; b.phase=wr ? "write throughput" : "read throughput"; b.pace=true;
+        if((wr&&cfg.direction=="read")||(!wr&&cfg.direction=="write")) continue;
+        Bench b(false,cfg); b.phase=wr ? "write throughput" : "read throughput";
+        b.pace=cfg.paced(); b.stress=cfg.scenario=="backpressure";
         unsigned seq=0;
+        auto pump=[&](bool accept_new) {
+            // 固定 RP0 便于分别测读/写上限；多 RP 乱序和公平性由功能场景覆盖。
+            const auto a=b.addr(0,cfg.burst,AXI_SIZE_CODE,seq%32);
+            if(wr) {
+                b.dut->s_axi_awvalid=accept_new && b.write_context.size()<8;
+                b.dut->s_axi_awaddr=a.addr; b.dut->s_axi_awid=a.id; b.dut->s_axi_awlen=a.len;
+                b.dut->s_axi_awsize=a.size; b.dut->s_axi_awburst=1; b.dut->s_axi_awqos=0;
+                b.dut->s_axi_awcache=a.cache; b.dut->s_axi_awprot=a.prot;
+                b.dut->s_axi_awlock=0; b.dut->s_axi_awuser=a.user;
+                b.dut->s_axi_wvalid=!b.write_context.empty();
+                if(!b.write_context.empty()) {
+                    const auto& c=b.write_context.front(); Bytes data{}; b.dut->s_axi_wstrb={};
+                    for(unsigned j=0;j<BYTES;j++) {
+                        data[j]=uint8_t(c.a.id*17+c.beat*29+j*7); set_bit(b.dut->s_axi_wstrb,j,true);
+                    }
+                    pack(b.dut->s_axi_wdata,data); b.dut->s_axi_wlast=c.beat==c.a.len;
+                    b.dut->s_axi_wuser=uint16_t(0x5100+c.beat);
+                }
+            } else {
+                b.dut->s_axi_arvalid=accept_new;
+                b.dut->s_axi_araddr=a.addr; b.dut->s_axi_arid=a.id; b.dut->s_axi_arlen=a.len;
+                b.dut->s_axi_arsize=a.size; b.dut->s_axi_arburst=1; b.dut->s_axi_arqos=0;
+                b.dut->s_axi_arcache=a.cache; b.dut->s_axi_arprot=a.prot;
+                b.dut->s_axi_arlock=0; b.dut->s_axi_aruser=a.user;
+            }
+            b.tick(); if(wr ? b.aw_fire : b.ar_fire) ++seq;
+        };
         auto load=[&](unsigned clocks) {
             const auto end=b.cycle+clocks;
             while(b.cycle<end) {
-                auto a=b.addr(0,16,AXI_SIZE_CODE,seq++%32);
-                if(wr) { b.aw(a); b.w(a,1); } else b.ar(a);
+                if(cfg.scenario=="baseline") {
+                    auto a=b.addr(0,cfg.burst,AXI_SIZE_CODE,seq++%32);
+                    if(wr) { b.aw(a); b.w(a,1); } else b.ar(a);
+                } else pump(true);
             }
         };
-        load(1500);
+        load(cfg.warmup);
         const auto start=b.cycle, completions=wr ? b.b_count : b.r_count;
         const auto first_frame=wr ? b.fwd_frames : b.rev_frames;
-        load(4000);
+        const unsigned dir=wr ? 0 : 1;
+        const auto used_start=b.used_granules[dir],empty_start=b.empty_frames[dir];
+        const auto stall_start=b.stalls; b.rob_peak=0;
+        load(cfg.cycles);
         const auto duration=(b.cycle-start)*2;
-        const auto bytes=((wr ? b.b_count : b.r_count)-completions)*BYTES*(wr ? 16 : 1);
+        const auto bytes=((wr ? b.b_count : b.r_count)-completions)*BYTES*(wr ? cfg.burst : 1);
         const auto frames=(wr ? b.fwd_frames : b.rev_frames)-first_frame;
+        const auto used=b.used_granules[dir]-used_start,empty=b.empty_frames[dir]-empty_start;
+        const auto stalls=b.stalls; const auto peak=b.rob_peak;
         const double bandwidth=double(bytes)/duration;
-        b.require(bytes>0&&frames>0&&bandwidth<=45.5,"invalid throughput accounting");
+        b.require(bytes>0&&frames>0,"invalid throughput accounting");
+        const unsigned g=wr ? (BYTES==32 ? 7 : BYTES==64 ? 14 : 27) : (BYTES==32 ? 8 : BYTES==64 ? 14 : 27);
+        const double wire_eff=double(cfg.burst*BYTES)/(g*5*cfg.burst+(wr ? 15 : 0))*240/256;
+        const double codec_cap=BYTES/2.0*(wr ? double(cfg.burst)/(cfg.burst+1) : 1);
+        double upper=std::min(codec_cap,BYTES/(2.0*cfg.mc_interval));
+        if(cfg.paced()) upper=std::min(upper,cfg.wire_gbps()*wire_eff);
+        // 完成窗口存在在途边界误差；上限检查容许两笔事务的差额，不改动实测值。
+        b.require(bandwidth<=upper+2.0*cfg.burst*BYTES/duration,"throughput exceeds configured upper bound");
+        const double rate=upper/BYTES*2;
+        const unsigned required_depth=unsigned(std::ceil(rate*cfg.credit_rtt_cycles))+2;
+        const unsigned configured_depth=wr ? TEST_WDATA_DEPTH : TEST_RX_DEPTH;
+        const double achieved=bandwidth/cfg.target_gbps;
+        // 已经拉高但尚未握手的地址继续保持；完成后才停止新地址，收尾不计入测量窗。
+        if(cfg.scenario!="baseline") {
+            while(wr ? (b.dut->s_axi_awvalid&&!b.aw_fire) : (b.dut->s_axi_arvalid&&!b.ar_fire)) pump(true);
+        }
+        // 发完已经接受 AW 的所有 W，最后等待全部 R/B 并核对内存。
+        b.dut->s_axi_awvalid=0; b.dut->s_axi_arvalid=0;
+        if(wr && cfg.scenario!="baseline") while(!b.write_context.empty()) pump(false);
+        b.dut->s_axi_wvalid=0;
         b.drain();
         std::cout<<std::fixed<<std::setprecision(4)
                  <<"PERF "<<(wr ? "write" : "read")<<" width="<<AXI_DATA_WIDTH<<" RP="<<TEST_RP
+                 <<" scenario="<<cfg.scenario
                  <<" duration_ns="<<duration<<" completed_bytes="<<bytes<<" data_direction_frames="<<frames
-                 <<" GBps="<<bandwidth<<" time_eff_percent="<<bandwidth/45*100
-                 <<" window_payload_ratio_percent="<<double(bytes)/(frames*240)*100<<"\n";
+                 <<" GBps="<<bandwidth<<" target_GBps="<<cfg.target_gbps<<" target_percent="<<achieved*100
+                 <<" theoretical_upper_GBps="<<upper<<" upper_percent="<<bandwidth/upper*100
+                 <<" message_area_fill_percent="<<double(used)/(frames*48)*100
+                 <<" empty_frames="<<empty<<"\n";
+        std::cout<<"CREDIT data_kind="<<(wr ? "WDATA" : "RDATA")<<" granules_per_message="<<g
+                 <<" assumed_RTT_cycles="<<cfg.credit_rtt_cycles<<" required_depth_with_2_spares="<<required_depth
+                 <<" configured_depth="<<configured_depth<<" configured_granules="<<configured_depth*g
+                 <<" capacity_sufficient="<<(configured_depth>=required_depth)<<"\n";
+        static const char* names[]={"soc_msg_block","target_msg_block","soc_credit_wait","target_credit_wait",
+            "rob_full","rob_head_wait","rob_reply_block","soc_frame_block","target_frame_block",
+            "forward_block","reverse_block","mc_ready_block","mc_no_request","axi_r_block"};
+        std::cout<<"STALL_CYCLES(nonexclusive)";
+        for(unsigned n=0;n<stalls.size();n++) std::cout<<" "<<names[n]<<"="<<stalls[n]-stall_start[n];
+        std::cout<<" rob_peak="<<peak<<"\n";
+        if(cfg.physical()) std::cout<<"PHYSICAL raw_GBps="<<cfg.raw_gbps()<<" budget_GBps="<<cfg.wire_gbps()
+            <<" serialization_ns="<<cfg.serial_ns()<<" one_way_model_ns="<<cfg.flight_ns()
+            <<" rtl_cycle_ns=2 (codec latency excluded from physical delay)\n";
+        b.require(achieved+1e-12>=cfg.min_efficiency,"requested bandwidth efficiency not reached");
     }
 }
 
@@ -484,14 +595,54 @@ void negative() {
 int sc_main(int argc,char** argv) {
     try {
         bool neg=false,trace=false,perf=false,corrupt=false;
+        BridgeTestConfig cfg;
         for(int i=1;i<argc;i++) {
             const std::string arg=argv[i];
+            auto value=[&]() -> std::string {
+                if(i+1>=argc) throw std::runtime_error("missing value for "+arg);
+                return argv[++i];
+            };
+            auto number=[&]() {
+                const auto s=value(); size_t end=0; const double n=std::stod(s,&end);
+                if(end!=s.size()||!std::isfinite(n)) throw std::runtime_error("invalid number for "+arg);
+                return n;
+            };
+            auto count=[&]() {
+                const double n=number();
+                if(n<0||n>1000000||std::floor(n)!=n) throw std::runtime_error("invalid count for "+arg);
+                return unsigned(n);
+            };
             if(arg=="--negative") neg=true; else if(arg=="--trace") trace=true;
             else if(arg=="--perf") perf=true; else if(arg=="--corrupt-read") corrupt=true;
+            else if(arg=="--help") { bridge_help(); return 0; }
+            else if(arg=="--scenario") {
+                cfg.scenario=value(); neg=cfg.scenario=="negative";
+                perf=cfg.scenario!="functional" && !neg;
+            }
+            else if(arg=="--direction") cfg.direction=value();
+            else if(arg=="--burst") cfg.burst=count();
+            else if(arg=="--warmup") cfg.warmup=count();
+            else if(arg=="--cycles") cfg.cycles=count();
+            else if(arg=="--mc-latency") cfg.mc_latency=count();
+            else if(arg=="--mc-interval") cfg.mc_interval=count();
+            else if(arg=="--credit-rtt-cycles") cfg.credit_rtt_cycles=count();
+            else if(arg=="--link-gbps") cfg.link_gbps=number();
+            else if(arg=="--target-gbps") cfg.target_gbps=number();
+            else if(arg=="--min-efficiency") cfg.min_efficiency=number();
+            else if(arg=="--package") cfg.package=value();
+            else if(arg=="--lanes") cfg.lanes=count();
+            else if(arg=="--modules") cfg.modules=count();
+            else if(arg=="--lane-gbps") cfg.lane_gbps=number();
+            else if(arg=="--shoreline-mm") cfg.shoreline_mm=number();
+            else if(arg=="--density-gbps-mm") cfg.density_gbps_mm=number();
+            else if(arg=="--phy-ns") cfg.phy_ns=number();
+            else if(arg=="--prop-ns") cfg.prop_ns=number();
+            else if(arg=="--cdc-ns") cfg.cdc_ns=number();
+            else if(arg=="--adapter-ns") cfg.adapter_ns=number();
             else throw std::runtime_error("unknown argument: "+arg);
         }
         if(neg) negative();
-        else if(perf) performance();
+        else if(perf) performance(cfg);
         else if(corrupt) { Bench b; b.phase="checker negative control"; b.corrupt_read=true; b.read(b.addr(0,1,AXI_SIZE_CODE,1)); }
         else functional(trace);
         return 0;

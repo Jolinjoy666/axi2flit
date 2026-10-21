@@ -9,6 +9,14 @@ RP ?= 1
 JOBS ?= 2
 DEPTH ?= 3
 FWFT ?= 0
+LINK_DEPTH ?= 64
+RX_DEPTH ?= 32
+WDATA_DEPTH ?= 32
+REQUEST_DEPTH ?= 4
+RESPONSE_DEPTH ?= 8
+MC_SLOTS ?= 16
+SCENARIO ?= saturated
+FRAME_DEPTH ?= 2
 ROOT := $(abspath ..)
 BUILD := $(abspath build/w$(WIDTH)_rp$(RP))
 RTL := $(ROOT)/rtl/aou_pkg.sv $(ROOT)/rtl/aou_sync_fifo.sv \
@@ -26,8 +34,10 @@ build:
 	@mkdir -p $(BUILD)
 	$(VERILATOR) --cc --exe --build -j $(JOBS) --trace $(VFLAGS) \
 	  --top-module tb_rtl_bridge -GDATA_WIDTH=$(WIDTH) -GRP_COUNT=$(RP) \
+	  -GLINK_DEPTH=$(LINK_DEPTH) -GRX_DEPTH=$(RX_DEPTH) -GWDATA_DEPTH=$(WDATA_DEPTH) \
+	  -GREQUEST_DEPTH=$(REQUEST_DEPTH) -GRESPONSE_DEPTH=$(RESPONSE_DEPTH) -GMC_SLOTS=$(MC_SLOTS) \
 	  --Mdir $(BUILD) $(RTL) $(ROOT)/sim/tb/tb_rtl_bridge.sv $(ROOT)/sim/tb/tb_rtl_bridge.cpp \
-	  -CFLAGS '-std=c++17 -DAXI_DATA_WIDTH_CFG=$(WIDTH) -DTEST_RP=$(RP) -I$(ROOT)/systemc/include -I$(SYSTEMC_HOME)/include' \
+	  -CFLAGS '-std=c++17 -DAXI_DATA_WIDTH_CFG=$(WIDTH) -DTEST_RP=$(RP) -DTEST_RX_DEPTH=$(RX_DEPTH) -DTEST_WDATA_DEPTH=$(WDATA_DEPTH) -I$(ROOT)/systemc/include -I$(SYSTEMC_HOME)/include' \
 	  -LDFLAGS '-L$(SYSTEMC_HOME)/lib -Wl,-rpath,$(SYSTEMC_HOME)/lib -lsystemc'
 
 run: build
@@ -47,6 +57,11 @@ perf: build
 	@mkdir -p results
 	$(BUILD)/Vtb_rtl_bridge --perf | tee results/perf_$(WIDTH)_rp$(RP).log
 
+.PHONY: scenario
+scenario: build
+	@mkdir -p results
+	$(BUILD)/Vtb_rtl_bridge --scenario $(SCENARIO) $(ARGS) | tee results/$(SCENARIO)_$(WIDTH)_rp$(RP).log
+
 perf-all:
 	@for w in 256 512 1024; do $(MAKE) WIDTH=$$w RP=1 perf; done
 
@@ -54,13 +69,15 @@ perf-all:
 checker-negative: build
 	@mkdir -p results
 	@rc=0; $(BUILD)/Vtb_rtl_bridge --corrupt-read > results/checker_negative.log 2>&1 || rc=$$?; \
-	  test $$rc -eq 1; rg -q 'RTL FAIL: checker negative control.*R data mismatch' results/checker_negative.log; \
+	  test $$rc -eq 1; grep -q 'RTL FAIL: checker negative control.*R data mismatch' results/checker_negative.log; \
 	  echo 'CHECKER NEGATIVE PASS: expected read mismatch detected'
 
 check:
 	$(MAKE) fifo-all
+	$(MAKE) codec-all
 	$(MAKE) test-all
 	$(MAKE) perf-all
+	$(MAKE) scenario WIDTH=1024 RP=1 SCENARIO=saturated ARGS='--min-efficiency 0.90'
 	$(MAKE) WIDTH=256 RP=1 checker-negative
 
 fifo:
@@ -76,3 +93,18 @@ fifo-all:
 
 help:
 	@echo 'make lint/run/negative/perf WIDTH=256 RP=1；make fifo DEPTH=3 FWFT=1；make test-all/perf-all/check；波形：make run ARGS=--trace'
+	@echo 'make codec-all；make scenario WIDTH=1024 SCENARIO=saturated ARGS="--min-efficiency 0.90"；运行参数：make run ARGS=--help'
+
+.PHONY: codec codec-all
+codec:
+	@mkdir -p build/codec_$(WIDTH)_d$(FRAME_DEPTH) results
+	$(VERILATOR) --cc --exe --build -j $(JOBS) $(VFLAGS) --top-module tb_flit_codec \
+	  -GFRAME_DEPTH=$(FRAME_DEPTH) --Mdir $(ROOT)/sim/build/codec_$(WIDTH)_d$(FRAME_DEPTH) \
+	  $(RTL) $(ROOT)/sim/tb/tb_flit_codec.sv $(ROOT)/sim/tb/tb_flit_codec.cpp \
+	  -CFLAGS '-std=c++17 -DAXI_DATA_WIDTH_CFG=$(WIDTH) -I$(ROOT)/systemc/include -I$(SYSTEMC_HOME)/include' \
+	  -LDFLAGS '-L$(SYSTEMC_HOME)/lib -Wl,-rpath,$(SYSTEMC_HOME)/lib -lsystemc'
+	$(ROOT)/sim/build/codec_$(WIDTH)_d$(FRAME_DEPTH)/Vtb_flit_codec | tee results/codec_$(WIDTH)_d$(FRAME_DEPTH).log
+
+codec-all:
+	@for w in 256 512 1024; do $(MAKE) codec WIDTH=$$w; done
+	$(MAKE) codec WIDTH=1024 FRAME_DEPTH=3

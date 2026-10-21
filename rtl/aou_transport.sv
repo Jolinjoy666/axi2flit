@@ -136,36 +136,11 @@ module aou_transport #(
         raw_ready = 0;
         for (int p = 0; p < RP_COUNT; p++) begin
             fifo_valid[p] = '0;
-            for (int k = 0; k < MSG_KIND_COUNT; k++) begin
-                updates[p][k] = '0;
-            end
-        end
-        if (ph_valid && int'(ph_credit[15:14]) < RP_COUNT) begin
-            for (int k = 0; k < MSG_KIND_COUNT; k++) begin
-                if (k < 4) begin
-                    updates[ph_credit[15:14]][k] = 9'(credit_amount(int'(ph_credit[k*3 +:3])));
-                end else begin
-                    updates[ph_credit[15:14]][k] = 9'(credit_amount(int'(ph_credit[13:12])));
-                end
-            end
         end
         if (raw_valid && link_up && !fault) begin
             if (raw_kind == 5) begin
                 bad_msg = raw_msg[1199:1196] != 0 || raw_msg[1195:1193] != 4 || raw_msg[1136:1120] != 0;
                 raw_ready = 1;
-                if (!bad_msg) begin
-                    // CrdtGrant：类型 0、操作码 100；四类三位 credit 按类型及 RP0～3 排列，
-                    // 最后是四组两位写响应 credit，未启用 RP 的字段不入账。
-                    for (int p = 0; p < RP_COUNT; p++) begin
-                        for (int k = 0; k < MSG_KIND_COUNT; k++) begin
-                            if (k < 4) begin
-                                updates[p][k] = updates[p][k] + 9'(credit_amount(int'(raw_msg[1199-7-(k*4+p)*3 -:3])));
-                            end else begin
-                                updates[p][k] = updates[p][k] + 9'(credit_amount(int'(raw_msg[1199-55-p*2 -:2])));
-                            end
-                        end
-                    end
-                end
             end else begin
                 bad_msg = raw_rp >= RP_COUNT || depth(raw_kind) == 0 || raw_size == 0;
                 if (raw_kind == 0 || raw_kind == 1) begin
@@ -185,6 +160,36 @@ module aou_transport #(
                 end else begin
                     fifo_valid[raw_rp][raw_kind] = 1;
                     raw_ready = fifo_ready[raw_rp][raw_kind];
+                end
+            end
+        end
+    end
+
+    // PH 授信与消息路由分开计算，输入 ready 不进入消息输出 ready 的组合锥。
+    always_comb begin
+        for (int p = 0; p < RP_COUNT; p++) begin
+            for (int k = 0; k < MSG_KIND_COUNT; k++) begin
+                updates[p][k] = '0;
+            end
+        end
+        if (ph_valid && int'(ph_credit[15:14]) < RP_COUNT) begin
+            for (int k = 0; k < MSG_KIND_COUNT; k++) begin
+                if (k < 4) begin
+                    updates[ph_credit[15:14]][k] = 9'(credit_amount(int'(ph_credit[k*3 +:3])));
+                end else begin
+                    updates[ph_credit[15:14]][k] = 9'(credit_amount(int'(ph_credit[13:12])));
+                end
+            end
+        end
+        // CrdtGrant：四类三位 credit 按类型及 RP 排列，最后四组为两位写响应 credit。
+        if (raw_valid && raw_ready && !bad_msg && raw_kind == 5) begin
+            for (int p = 0; p < RP_COUNT; p++) begin
+                for (int k = 0; k < MSG_KIND_COUNT; k++) begin
+                    if (k < 4) begin
+                        updates[p][k] = updates[p][k] + 9'(credit_amount(int'(raw_msg[1199-7-(k*4+p)*3 -:3])));
+                    end else begin
+                        updates[p][k] = updates[p][k] + 9'(credit_amount(int'(raw_msg[1199-55-p*2 -:2])));
+                    end
                 end
             end
         end

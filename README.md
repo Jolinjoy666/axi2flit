@@ -65,11 +65,11 @@ RTL 独立入口需要 Verilator（本次验证为 5.052）及上述 SystemC 库
 
 ```bash
 make -C sim run WIDTH=256 RP=1       # RTL 闭环功能、时延与复位
-make -C sim check                    # FIFO、9 配置功能/异常、三位宽性能、记分板负向控制
+make -C sim check                    # FIFO/codec、9 配置功能/异常、性能及 90% 门限、记分板负向控制
 make -C sim run ARGS=--trace          # 生成 sim/results/*.vcd
 ```
 
-RTL 构建位于 `sim/build/`，日志及波形位于 `sim/results/`。MC 接口语义、测试覆盖和实测性能见下列 RTL 文档；RTL 当前持续吞吐尚未达到 90% 时间利用率要求。
+RTL 构建位于 `sim/build/`，日志及波形位于 `sim/results/`。1024 位满载场景已接近 48GB/s 链路预算下的协议上限：读约 42.67GB/s、写约 42.37GB/s；相对 45GB/s 测试基准超过 90%。真实存储阵列的验收分母及物理时序仍需另行确定。场景命令、credit 计算和测量边界见 [RTL 吞吐优化与场景配置](doc/RTL吞吐优化与场景配置.md)。
 
 ## 目录与文档
 
