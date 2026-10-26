@@ -5,10 +5,10 @@ package aou_pkg;
     // 帧、消息、粒度和 10 位 AXI ID 的固定宽度。
     localparam int MSG_BITS = 1200; // 最大 WDATA1024：30 granule × 5B
     localparam int FLIT_BITS = 2000; // 逻辑 FDI：10B PH + 240B payload
-    localparam int MSG_KIND_COUNT = 5;
-    localparam int FLIT_GRANULES = 48;
-    localparam int MSG_MAX_GRANULES = 30;
-    localparam int GRANULE_BITS = 40;
+    localparam int MSG_KIND_COUNT = 5; // 写请求/读请求/写数据/读数据/写响应（WDATA与WDATAFULL合并一类）
+    localparam int FLIT_GRANULES = 48; // 每帧 48 粒度（240B）
+    localparam int MSG_MAX_GRANULES = 30; // 最大消息 30 粒度（150B）
+    localparam int GRANULE_BITS = 40; // 每粒度 5B（40 位）
     localparam int AXI_ID_COUNT = 1024; // 10 位 AXI ID 的取值总数
 
     // msg_t 保存最多 150B 消息；flit_t 保存 PH byte0～9 和载荷 byte0～239。
@@ -32,6 +32,14 @@ package aou_pkg;
     // DLENGTH=0/1/2 分别表示 256/512/1024 位，编码 3 非法；长度单位为 5B 粒度。
     function automatic int dl_code(input int width);
         return width == 256 ? 0 : width == 512 ? 1 : 2;
+    endfunction
+    // 数据消息宽度随传输大小：每拍不超过 32B 用 256 位消息，64B 用 512 位，128B 用 1024 位
+    // （规范读数据的要求；写数据同样处理）。窄数据只携带所在的那一组字节通道。
+    function automatic int dl_of_size(input logic [2:0] size);
+        return size <= 5 ? 0 : size == 6 ? 1 : 2;
+    endfunction
+    function automatic int dl_bytes(input int dl);
+        return 32 << dl;
     endfunction
     function automatic int msg_kind(input msg_t m);
         case (m[1199:1196])
@@ -60,18 +68,38 @@ package aou_pkg;
         endcase
     endfunction
 
-    // 请求各占 3 粒度，写响应占 1；写数据类按更短的全掩码格式预留容量。
-    // credit 每单位代表一个 5B 粒度；三位编码 0～7 对应 0、1、4、8、16、32、64、128。
-    // 写响应只用两位编码 0～3；发送时选择不超过待归还量的最大编码。
-    function automatic int min_granules(input int k, input int width);
+    // 接收存储以“单元”计：请求、写响应每条一个单元；数据消息按 8 粒度一块分块存放，
+    // 全宽消息占 DATA_WIDTH/256 块。credit 每单位代表一个 5B 粒度（规范 6.1 节）。
+    // 空闲单元可公布的 credit = floor(空闲单元 × credit_gran / credit_units)，比例取本端可能
+    // 收到的各长度消息中“块数/粒度数”的最大值，保证任意长度组合都不会超出存储。
+    function automatic int unit_count(input int k, input int width);
+        return (k == 2 || k == 3) ? width / 256 : 1;
+    endfunction
+    function automatic int credit_units(input int k, input int width);
+        return (k == 2 || k == 3) && width == 1024 ? 4 : 1;
+    endfunction
+    function automatic int credit_gran(input int k, input int width);
         case (k)
             0, 1: return 3;
-            2: return width == 256 ? 7 : width == 512 ? 14 : 27;
-            3: return width == 256 ? 8 : width == 512 ? 14 : 27;
+            2: return width == 1024 ? 27 : 7;
+            3: return width == 1024 ? 27 : width == 512 ? 7 : 8;
             4: return 1;
             default: return 0;
         endcase
     endfunction
+    function automatic int chunk_count(input int g);
+        return (g + 7) / 8;
+    endfunction
+    // 各类消息在本端位宽下的最大位数，用于确定队列存储宽度。
+    function automatic int msg_bits(input int k, input int width);
+        case (k)
+            0, 1: return 120;
+            2: return 40 * (width == 256 ? 8 : width == 512 ? 15 : 30);
+            3: return 40 * (width == 256 ? 8 : width == 512 ? 14 : 27);
+            default: return 40;
+        endcase
+    endfunction
+    // 三位编码 0～7 对应 0、1、4、8、16、32、64、128；写响应只用两位编码 0～3。
     function automatic int credit_amount(input int enc);
         case (enc)
             0: return 0;
@@ -124,34 +152,37 @@ package aou_pkg;
                (64'(a.addr[11:0])+total <= 4096);
     endfunction
 
-    // 写数据：类型/RP/DLENGTH/USER 共 3B，随后是完整总线 DATA，非全掩码时再跟 STRB 位图。
-    // 读数据：上述 3B 后接 ID(10)、RESP(2)、LAST(1)、保留(3)，再跟完整总线 DATA。
+    // 写数据：类型/RP/DLENGTH/USER 共 3B，随后是 DATA，非全掩码时再跟 STRB 位图。
+    // 读数据：上述 3B 后接 ID(10)、RESP(2)、LAST(1)、保留(3)，再跟 DATA。
     // 写响应：类型/RP/保留(2)、USER(16)、ID(10)、RESP(2)、保留(4)，共 5B。
-    // DATA 和 STRB 均先放高 byte lane；全掩码写数据省略 STRB，由类型 6 表示。
+    // DATA 取本拍所在的 dl_bytes 字节通道组（lane 为本拍字节地址对总线宽度取模），
+    // 先放高 byte lane；该组选通全为 1 时用全掩码格式省略 STRB。
     function automatic msg_t make_wdata(input logic [1023:0] data,
                                         input logic [127:0] strb,
                                         input logic [15:0] user, input int rp,
-                                        input int width);
+                                        input logic [2:0] size, input logic [6:0] lane);
         msg_t m;
         logic full;
-        int n;
-        n = width/8;
+        int dl, n, base;
+        dl = dl_of_size(size);
+        n = dl_bytes(dl);
+        base = (int'(lane) / n) * n;
         full = 1;
         for (int j = 0; j < 128; j++) begin
-            if (j < n && !strb[j]) begin
+            if (j < n && !strb[base+j]) begin
                 full = 0;
             end
         end
         m = '0;
-        m[1199:1176] = {full ? 4'h6 : 4'h3, 2'(rp), 2'(dl_code(width)), user};
+        m[1199:1176] = {full ? 4'h6 : 4'h3, 2'(rp), 2'(dl), user};
         for (int j = 0; j < 128; j++) begin
             if (j < n) begin
-                m[1199-(3+j)*8 -: 8] = data[(n-1-j)*8 +: 8];
+                m[1199-(3+j)*8 -: 8] = data[(base+n-1-j)*8 +: 8];
             end
         end
         for (int j = 0; j < 16; j++) begin
             if (!full && j < n/8) begin
-                m[1199-(3+n+j)*8 -: 8] = strb[(n/8-1-j)*8 +: 8];
+                m[1199-(3+n+j)*8 -: 8] = strb[base+(n/8-1-j)*8 +: 8];
             end
         end
         return m;
@@ -159,13 +190,17 @@ package aou_pkg;
     function automatic msg_t make_rdata(input logic [1023:0] data,
                                         input logic [9:0] id, input logic [15:0] user,
                                         input logic [1:0] resp, input logic last,
-                                        input int rp, input int width);
+                                        input int rp, input logic [2:0] size, input logic [6:0] lane);
         msg_t m;
+        int dl, n, base;
+        dl = dl_of_size(size);
+        n = dl_bytes(dl);
+        base = (int'(lane) / n) * n;
         m = '0;
-        m[1199:1160] = {4'h4,2'(rp),2'(dl_code(width)),user,id,resp,last,3'b0};
+        m[1199:1160] = {4'h4,2'(rp),2'(dl),user,id,resp,last,3'b0};
         for (int j = 0; j < 128; j++) begin
-            if (j < width/8) begin
-                m[1199-(5+j)*8 -: 8] = data[(width/8-1-j)*8 +: 8];
+            if (j < n) begin
+                m[1199-(5+j)*8 -: 8] = data[(base+n-1-j)*8 +: 8];
             end
         end
         return m;
@@ -174,29 +209,36 @@ package aou_pkg;
                                      input logic [1:0] resp, input int rp);
         return {4'h5,2'(rp),2'b0,user,id,resp,4'b0,1160'b0};
     endfunction
+    // 取出数据并复制到整条总线：各字节通道组得到同一份数据，窄传输的有效通道因而正确，
+    // 非活跃通道的取值按 AXI 规则无意义。
     function automatic logic [1023:0] get_data(input msg_t m, input int width);
         logic [1023:0] data;
-        int start;
+        int start, n;
         start = m[1199:1196] == 4 ? 5 : 3;
+        n = dl_bytes(int'(m[1193:1192]));
         data = '0;
         for (int j = 0; j < 128; j++) begin
             if (j < width/8) begin
-                data[(width/8-1-j)*8 +: 8] = m[1199-(start+j)*8 -: 8];
+                data[j*8 +: 8] = m[1199-(start+n-1-(j%n))*8 -: 8];
             end
         end
         return data;
     endfunction
-    function automatic logic [127:0] get_strb(input msg_t m, input int width);
+    // 选通只放在本拍所在的通道组，其余通道为 0。
+    function automatic logic [127:0] get_strb(input msg_t m, input logic [6:0] lane);
         logic [127:0] strb;
+        int n, base;
+        n = dl_bytes(int'(m[1193:1192]));
+        base = (int'(lane) / n) * n;
         strb = '0;
         for (int j = 0; j < 128; j++) begin
-            if (j < width/8 && m[1199:1196] == 6) begin
-                strb[j] = 1;
+            if (j < n && m[1199:1196] == 6) begin
+                strb[base+j] = 1;
             end
         end
         for (int j = 0; j < 16; j++) begin
-            if (j < width/64 && m[1199:1196] == 3) begin
-                strb[(width/64-1-j)*8 +: 8] = m[1199-(3+width/8+j)*8 -: 8];
+            if (j < n/8 && m[1199:1196] == 3) begin
+                strb[base+(n/8-1-j)*8 +: 8] = m[1199-(3+n+j)*8 -: 8];
             end
         end
         return strb;

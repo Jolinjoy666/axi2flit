@@ -1,7 +1,7 @@
 /*
- * 固定深度 FIFO 单元验证：检查空/满、同拍读写、指针回绕、FWFT 直通和联合清空。
+ * 同步 FIFO 单元验证：空/满、满时同拍读写、指针回绕、两种读出模式和复位。
+ * FWFT=1 时非空即可在 rd_data 看到队首；FWFT=0 时 rd_en 之后下一拍给出读出数据。
  * 期望队列使用独立软件 deque，不读取 DUT 的指针或存储内容。
- * 此测试不依赖 SystemC，只驱动 aou_sync_fifo 的实际 RTL 端口。
  */
 #include "Vaou_sync_fifo.h"
 #include "verilated.h"
@@ -10,75 +10,64 @@
 #include <stdexcept>
 
 #ifndef FIFO_FWFT
-#define FIFO_FWFT 0
+#define FIFO_FWFT 1
 #endif
 
 int main() {
     try {
         Vaou_sync_fifo dut;
+        constexpr bool fwft = FIFO_FWFT != 0;
         std::deque<unsigned> expected;
-        constexpr bool fwft=FIFO_FWFT!=0;
-        unsigned next=1,seed=0x12345678,full_replace=0,pushes=0,pops=0,bypasses=0;
-        bool held=false;
-        auto check=[](bool ok,const char* msg) { if(!ok) throw std::runtime_error(msg); };
-        auto reset=[&] {
-            dut.rst_n=0; dut.clk=0; dut.eval(); dut.clk=1; dut.eval();
-            expected.clear(); held=false;
-            check(!dut.m_valid&&!dut.s_ready&&dut.level==0,"reset state");
-            dut.rst_n=1;
+        unsigned next = 1, seed = 0x12345678, full_replace = 0, pushes = 0, pops = 0;
+        bool std_pending = false;     // 标准模式：上一拍有读出，本拍核对 rd_data
+        unsigned std_expect = 0;
+        auto check = [](bool ok, const char* msg) { if (!ok) throw std::runtime_error(msg); };
+        auto edge = [&] { dut.clk = 1; dut.eval(); dut.clk = 0; dut.eval(); };
+        auto reset = [&] {
+            dut.rst_n = 0; dut.wr_en = 0; dut.rd_en = 0; dut.clk = 0; dut.eval(); edge();
+            expected.clear(); std_pending = false;
+            check(dut.empty && !dut.full && dut.level == 0, "reset state");
+            dut.rst_n = 1; dut.eval();
         };
         reset();
 
-        // 空队列、上下游同时 ready/valid：FWFT 当拍直通，默认模式在时钟沿后出队。
-        dut.clk=0; dut.s_valid=1; dut.s_data=0xa5; dut.m_ready=1; dut.eval();
-        check(bool(dut.s_ready),"empty FIFO must accept input");
-        check(bool(dut.m_valid)==fwft,"empty-cycle FWFT valid mismatch");
-        if(fwft) check(dut.m_data==0xa5,"FWFT bypass data mismatch");
-        dut.clk=1; dut.eval();
-        dut.clk=0; dut.s_valid=0; dut.eval();
-        check(dut.level==(fwft?0u:1u),"empty-cycle bypass occupancy mismatch");
-        if(!fwft) check(dut.m_valid&&dut.m_data==0xa5,"registered first word mismatch");
-        if(fwft) ++bypasses;
+        // 空队列同时读写：写入不直通，读请求被忽略；时钟沿后成为队首。
+        dut.wr_en = 1; dut.wr_data = 0xa5; dut.rd_en = 1; dut.eval();
+        edge();
+        dut.wr_en = 0; dut.rd_en = 0; dut.eval();
+        check(dut.level == 1 && !dut.empty, "write to empty FIFO lost");
+        if (fwft) check(dut.rd_data == 0xa5, "FWFT head not visible");
+        dut.rd_en = 1; dut.eval(); edge(); dut.rd_en = 0; dut.eval();
+        check(dut.empty, "read did not consume head");
+        if (!fwft) check(dut.rd_data == 0xa5, "standard mode read data not registered");
         reset();
 
-        // 下游背压时先写入存储，撤掉输入后队首仍须保持有效和数据稳定。
-        dut.clk=0; dut.s_valid=1; dut.s_data=0x5a; dut.m_ready=0; dut.eval();
-        check(bool(dut.m_valid)==fwft,"stalled empty FIFO valid mismatch");
-        dut.clk=1; dut.eval();
-        dut.clk=0; dut.s_valid=0; dut.m_ready=1; dut.eval();
-        check(dut.level==1&&dut.m_valid&&dut.m_data==0x5a,"stalled first word lost");
-        reset();
-
-        for(unsigned cycle=0;cycle<6000;cycle++) {
-            if(cycle==3000) reset();
-            seed=seed*1664525u+1013904223u;
-            dut.clk=0;
-            // 先填满，再连续同拍出入，随后固定种子组合背压。被背压的输入不撤回。
-            dut.s_valid=held||cycle<200||(seed&3)!=0;
-            dut.s_data=next;
-            dut.m_ready=cycle>=100&&(cycle<200||(seed&0x70)!=0);
+        for (unsigned cycle = 0; cycle < 6000; cycle++) {
+            if (cycle == 3000) reset();
+            seed = seed * 1664525u + 1013904223u;
+            // 先填满，再连续同拍读写，随后固定种子组合读写。
+            dut.wr_en = cycle < 200 || (seed & 3) != 0;
+            dut.wr_data = next;
+            dut.rd_en = cycle >= 100 && (cycle < 200 || (seed & 0x70) != 0);
             dut.eval();
-            const bool bypass=fwft&&expected.empty()&&bool(dut.s_valid);
-            check(dut.level==expected.size(),"occupancy differs from scoreboard");
-            check(bool(dut.m_valid)==(!expected.empty()||bypass),"empty/valid mismatch");
-            const bool pop=dut.m_valid&&dut.m_ready,push=dut.s_valid&&dut.s_ready;
-            check(bool(dut.s_ready)==(expected.size()<FIFO_DEPTH||pop),"full/ready mismatch");
-            if(expected.size()==FIFO_DEPTH&&pop&&push) ++full_replace;
-            if(dut.m_valid) check(dut.m_data==(bypass?next:expected.front()),"FIFO ordering/data mismatch");
-            if(bypass&&pop&&push) { ++bypasses; ++pops; ++pushes; ++next; }
-            else {
-                if(pop) { expected.pop_front(); ++pops; }
-                if(push) { expected.push_back(next++); ++pushes; }
-            }
-            held=dut.s_valid&&!dut.s_ready;
-            dut.clk=1; dut.eval();
+            check(dut.level == expected.size(), "occupancy differs from scoreboard");
+            check(bool(dut.empty) == expected.empty(), "empty flag mismatch");
+            check(bool(dut.full) == (expected.size() == FIFO_DEPTH), "full flag mismatch");
+            if (!fwft && std_pending) check(dut.rd_data == std_expect, "standard mode data mismatch");
+            if (fwft && !expected.empty()) check(dut.rd_data == expected.front(), "FWFT head mismatch");
+            const bool pop = dut.rd_en && !expected.empty();
+            const bool push = dut.wr_en && (expected.size() < FIFO_DEPTH || pop);
+            if (expected.size() == FIFO_DEPTH && pop && push) ++full_replace;
+            std_pending = pop;
+            if (pop) { std_expect = expected.front(); expected.pop_front(); ++pops; }
+            if (push) { expected.push_back(next++); ++pushes; }
+            edge();
         }
-        check(full_replace>0&&pushes>FIFO_DEPTH*4&&pops>FIFO_DEPTH*4,"missing wrap/full replacement coverage");
+        check(full_replace > 0 && pushes > FIFO_DEPTH * 4 && pops > FIFO_DEPTH * 4,
+              "missing wrap/full replacement coverage");
         dut.final();
-        std::cout<<"FIFO PASS depth="<<FIFO_DEPTH<<" fwft="<<FIFO_FWFT
-                 <<" pushes="<<pushes<<" pops="<<pops
-                 <<" simultaneous_full_replace="<<full_replace
-                 <<" empty_bypass="<<bypasses<<"\n";
+        std::cout << "FIFO PASS depth=" << FIFO_DEPTH << " fwft=" << FIFO_FWFT << " pushes=" << pushes
+                  << " pops=" << pops << " simultaneous_full_replace=" << full_replace << "\n";
         return 0;
-    } catch(const std::exception& e) { std::cerr<<"FIFO FAIL: "<<e.what()<<"\n"; return 1; }
+    } catch (const std::exception& e) { std::cerr << "FIFO FAIL: " << e.what() << "\n"; return 1; }
 }

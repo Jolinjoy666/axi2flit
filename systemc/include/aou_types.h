@@ -42,9 +42,9 @@ static constexpr unsigned DEFAULT_RESOURCE_PLANES = 1;
 // ============================================================
 //  链路参数（用于 FIFO/credit 容量反推，以及 testbench 的速率节流）
 // ============================================================
-// 默认按 16 条通道、每通道 24GT/s 计算聚合裸带宽。
-// 裸链路字节速率（B/ns）：16 lane × 24 Gbps ÷ 8 = 48 GB/s = 48 B/ns
-// 参数和 NRZ/PAM4 位数统一定义在 link_config.h；上式是默认 NRZ 配置。
+// 默认按 8 条通道、每通道 24GT/s、PAM4 计算聚合裸带宽。
+// 裸链路字节速率（B/ns）：8 lane × 24 GT/s × 2 bit ÷ 8 = 48 GB/s
+// 通道数和 NRZ/PAM4 位数统一定义在 link_config.h。
 // 一个 256B Flit 在链路上占用的时间（ns）：256 / 48 ≈ 5.333ns
 static constexpr double FLIT_PERIOD_NS     = FLIT_TOTAL_BYTES / LINK_BYTES_PER_NS;
 
@@ -214,34 +214,26 @@ static constexpr double MODEL_CLK_PERIOD_NS = 2.0;
 static constexpr unsigned CREDIT_LOOP_CYCLES =
     static_cast<unsigned>(CREDIT_LOOP_NS / MODEL_CLK_PERIOD_NS);
 
-// ---- 接收侧（决定我们发给对端的初始 credit）----
-// ReadData：受链路灌入速率约束，深度必须随数据位宽变化。
-// 环路内的在飞字节数 = CREDIT_LOOP_NS × 48B/ns = 56 × 48 = 2688 B
-//   256b （ 8 granule/条）：商取整数 63，+1+4 = 68 条
-//   512b （14 granule/条）：商取整数 36，+1+4 = 41 条
-//   1024b（27 granule/条）：商取整数 18，+1+4 = 23 条
-// 三者对应的"在飞字节数"是一样的（≈2688B），只是每条消息更大、条数更少。
-// messages_in_flight() 包含加一的余量，FIFO 另加四条固定余量。
-static constexpr unsigned RX_RDATA_FIFO_DEPTH_PER_RP =
-    messages_in_flight(CFG_RDATA_GRANULES) + FIFO_MARGIN_ENTRIES;
-
-// WriteResp：源头是本端发出的写请求，速率上限是 AXI AW 的 1 条/拍，
-//   而不是链路带宽。因此按 credit 环路的周期数定深度：28 + 4 = 32 条
-static constexpr unsigned RX_WRESP_FIFO_DEPTH_PER_RP =
-    CREDIT_LOOP_CYCLES + FIFO_MARGIN_ENTRIES;
-
-// credit 以 granule 计：容量（条） × 每条消息的 granule 数
+// ---- 队列容量：与 RTL 参数默认值一致（axi2flit_soc RX_DEPTH/TX_DEPTH，flit2mc_target 各深度）----
+// 接收 FIFO 以条计，初始公布的 credit = 深度 × 该类最短消息粒度数。
+// 32 条 RDATA 对应 1024 位时 864 粒度，覆盖约 32 拍 credit 回收环路下的满速读。
+#ifndef AOU_RX_DEPTH
+#define AOU_RX_DEPTH 32
+#endif
+static constexpr unsigned RX_RDATA_FIFO_DEPTH_PER_RP = AOU_RX_DEPTH;
+static constexpr unsigned RX_WRESP_FIFO_DEPTH_PER_RP = AOU_RX_DEPTH;
 static constexpr unsigned RX_RDATA_CREDITS_PER_RP =
-    RX_RDATA_FIFO_DEPTH_PER_RP * CFG_RDATA_GRANULES;  // 随位宽变化：8/14/27
+    RX_RDATA_FIFO_DEPTH_PER_RP * CFG_RDATA_GRANULES;   // 256/512/1024 位：256/448/864
 static constexpr unsigned RX_WRESP_CREDITS_PER_RP =
-    RX_WRESP_FIFO_DEPTH_PER_RP * WRESP_GRANULES;    // WriteResp   = 1 granule/条
-
-// ---- 发送侧（只是抹平 AXI 突发与打包节奏的缓冲，不参与 credit 协商）----
-// 深度取"一个 flit 能装下的最多消息条数"量级即可：
-//   48 granule ÷ 3 granule(请求) = 16 条；÷ 7 granule(WriteDataFull) ≈ 7 条，
-//   这里给写数据留两个 flit 的余量。
-static constexpr unsigned TX_REQ_FIFO_DEPTH_PER_RP   = 16;
-static constexpr unsigned TX_WDATA_FIFO_DEPTH_PER_RP = 16;
+    RX_WRESP_FIFO_DEPTH_PER_RP * WRESP_GRANULES;
+// 发送队列只平滑 AXI 与组帧节奏，不参与 credit 协商；三类请求消息同深度。
+static constexpr unsigned TX_REQ_FIFO_DEPTH_PER_RP   = 8;
+static constexpr unsigned TX_WDATA_FIFO_DEPTH_PER_RP = TX_REQ_FIFO_DEPTH_PER_RP;
+// 存储侧：每 RP 的 WREQ/RREQ、WDATA 接收深度，响应发送深度，以及 MC 在途命令（ROB）项数。
+static constexpr unsigned TARGET_REQUEST_DEPTH  = 4;
+static constexpr unsigned TARGET_WDATA_DEPTH    = 32;
+static constexpr unsigned TARGET_RESPONSE_DEPTH = 8;
+static constexpr unsigned TARGET_MC_SLOTS       = 16;
 
 class BitWriter {
 public:

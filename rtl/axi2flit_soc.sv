@@ -1,12 +1,17 @@
 // SoC 侧协议桥：对主机表现为 AXI4 Slave；对链路提供双向 250B Flit ready/valid。
 // 固定协议字段：ADDR=64、ID=10、USER=16；DATA_WIDTH 与 RP_COUNT 可参数化。
 // AW/W/AR 独立缓冲；W 依次关联 AW，不要求 AW 与 W 同拍到达。
+// 写数据与读数据消息按每拍传输大小选择宽度（256/512/1024 位），窄传输只携带所在通道组。
 // 同 ID 未完成事务跨 RP 时先背压，等旧事务完成后再接收，避免跨 RP 响应乱序。
 module axi2flit_soc #(
     parameter int DATA_WIDTH = 256,
-    parameter int RP_COUNT = 1,
-    parameter int TX_DEPTH = 8,
-    parameter int RX_DEPTH = 32
+    parameter int RP_COUNT = 1,  // RP 数量
+    parameter int TX_DEPTH = 8,  // 每个 RP/类型的发送 FIFO 深度
+    // 接收缓冲深度（单位：全宽消息条数（27粒度）），决定向对端公布的 RDATA/WRESP credit。
+    parameter int RDATA_DEPTH = 24,  // 每个RP的读数据接收容量
+    parameter int WRESP_DEPTH = 24,  // 每个RP的写响应接收容量
+    // 每个 AXI ID 每方向的在途事务计数位宽；计满时对该 ID 的新请求背压。
+    parameter int ID_CNT_WIDTH = 8
 ) (
     // 时钟、复位与链路使能。
     input logic clk,
@@ -90,15 +95,16 @@ module axi2flit_soc #(
 
     // 响应仲裁轮询位置及背压期间的 RP 锁定状态。
     int unsigned r_next, b_next, r_hold, b_hold;
-    logic r_locked,b_locked, route_valid,route_ready,route_pop;
+    logic r_locked,b_locked, route_valid,route_ready,route_pop,route_full,route_empty;
 
-    // 写请求路由 FIFO 及 W beat 位置。
-    logic [9:0] route_head;
+    // 写请求路由 FIFO：{RP, AWLEN, AWSIZE, 起始字节通道}；W beat 位置与本拍字节通道。
+    logic [19:0] route_head;
     logic [8:0] w_index;
+    logic [6:0] w_lane;
     logic aw_legal,ar_legal,w_legal,r_bad,b_bad;
 
     // 每个 AXI ID 的未完成事务数与固定 RP 归属。
-    logic [15:0] rd_count[AXI_ID_COUNT],wr_count[AXI_ID_COUNT];
+    logic [ID_CNT_WIDTH-1:0] rd_count[AXI_ID_COUNT],wr_count[AXI_ID_COUNT];
     logic [1:0] rd_rp[AXI_ID_COUNT],wr_rp[AXI_ID_COUNT];
 
     // 当前选中的读、写响应消息。
@@ -112,15 +118,16 @@ module axi2flit_soc #(
                          s_axi_arcache, s_axi_arqos, s_axi_arlock, s_axi_aruser};
     assign aw_rp = int'(s_axi_awqos)%RP_COUNT;
     assign ar_rp = int'(s_axi_arqos)%RP_COUNT;
-    assign w_rp = int'(route_head[9:8]);
+    assign w_rp = int'(route_head[19:18]);
     assign aw_legal = legal_req(aw_fields, DATA_WIDTH) && s_axi_awburst == 1;
     assign ar_legal = legal_req(ar_fields, DATA_WIDTH) && s_axi_arburst == 1;
-    assign w_legal = s_axi_wlast == (w_index == {1'b0, route_head[7:0]});
+    assign w_legal = s_axi_wlast == (w_index == {1'b0, route_head[17:10]});
+    assign w_lane = 7'((int'(route_head[6:0]) + (int'(w_index) << route_head[9:7])) % (DATA_WIDTH/8));
     assign s_axi_awready = link_up && !protocol_error && route_ready && in_ready[aw_rp][0] &&
-                           wr_count[s_axi_awid] != 16'hffff &&
+                           wr_count[s_axi_awid] != '1 &&
                            (wr_count[s_axi_awid] == 0 || wr_rp[s_axi_awid] == 2'(aw_rp));
     assign s_axi_arready = link_up && !protocol_error && in_ready[ar_rp][1] &&
-                           rd_count[s_axi_arid] != 16'hffff &&
+                           rd_count[s_axi_arid] != '1 &&
                            (rd_count[s_axi_arid] == 0 || rd_rp[s_axi_arid] == 2'(ar_rp));
     assign s_axi_wready = link_up && !protocol_error && route_valid && in_ready[w_rp][2];
     assign aw_fire = s_axi_awvalid && s_axi_awready;
@@ -132,20 +139,21 @@ module axi2flit_soc #(
 
     // 实例连接：AW 对应的 RP/长度先进入路由 FIFO，W 依序取出。
     aou_sync_fifo #(
-        .WIDTH(10),
-        .DEPTH(TX_DEPTH * RP_COUNT),
-        .FWFT(1'b0)
+        .WIDTH(20),
+        .DEPTH(TX_DEPTH * RP_COUNT)
     ) u_write_route (
         .clk(clk),
         .rst_n(rst_n),
-        .s_valid(aw_fire && aw_legal),
-        .s_ready(route_ready),
-        .s_data({2'(aw_rp), s_axi_awlen}),
-        .m_valid(route_valid),
-        .m_ready(route_pop),
-        .m_data(route_head),
+        .wr_en(aw_fire && aw_legal),
+        .wr_data({2'(aw_rp), s_axi_awlen, s_axi_awsize, s_axi_awaddr[6:0]}),
+        .full(route_full),
+        .rd_en(route_pop),
+        .rd_data(route_head),
+        .empty(route_empty),
         .level()
     );
+    assign route_ready = !route_full || route_pop;
+    assign route_valid = !route_empty;
 
     // 组合逻辑：AXI 请求转换为 AoU 消息，并写入对应 RP/类型 FIFO。
     always_comb begin
@@ -161,29 +169,36 @@ module axi2flit_soc #(
         in_data[ar_rp][1] = make_req(ar_fields,0,ar_rp);
         if (route_valid) begin
             in_valid[w_rp][2] = w_fire && w_legal;
-            in_data[w_rp][2] = make_wdata(1024'(s_axi_wdata),128'(s_axi_wstrb),s_axi_wuser,w_rp,DATA_WIDTH);
+            in_data[w_rp][2] = make_wdata(1024'(s_axi_wdata),128'(s_axi_wstrb),s_axi_wuser,w_rp,
+                                          route_head[9:7],w_lane);
         end
     end
 
     // 实例连接：请求 FIFO 与共享传输层。
+    // 发送队列按该类消息在本端位宽下的最大位数存储，出队时补零为完整消息向量。
     for (genvar rp = 0; rp < RP_COUNT; rp++) begin : g_rp
         for (genvar k = 0; k < MSG_KIND_COUNT; k++) begin : g_tx
             if (k < 3) begin : g_queue
+                localparam int W = msg_bits(k, DATA_WIDTH);
+                logic [W-1:0] m_bits;
+                logic full, empty;
                 aou_sync_fifo #(
-                    .WIDTH(MSG_BITS),
-                    .DEPTH(TX_DEPTH),
-                    .FWFT(1'b0)
+                    .WIDTH(W),
+                    .DEPTH(TX_DEPTH)
                 ) u_fifo (
                     .clk(clk),
                     .rst_n(rst_n),
-                    .s_valid(in_valid[rp][k]),
-                    .s_ready(in_ready[rp][k]),
-                    .s_data(in_data[rp][k]),
-                    .m_valid(tx_valid[rp][k]),
-                    .m_ready(tx_ready[rp][k]),
-                    .m_data(tx_data[rp][k]),
+                    .wr_en(in_valid[rp][k]),
+                    .wr_data(in_data[rp][k][MSG_BITS-1 -: W]),
+                    .full(full),
+                    .rd_en(tx_ready[rp][k]),
+                    .rd_data(m_bits),
+                    .empty(empty),
                     .level()
                 );
+                assign in_ready[rp][k] = !full || (tx_ready[rp][k] && !empty);
+                assign tx_valid[rp][k] = !empty;
+                assign tx_data[rp][k] = {m_bits, {(MSG_BITS-W){1'b0}}};
             end else begin : g_no_queue
                 assign tx_valid[rp][k] = 0;
                 assign tx_data[rp][k] = '0;
@@ -194,8 +209,8 @@ module axi2flit_soc #(
     aou_transport #(
         .DATA_WIDTH(DATA_WIDTH),
         .RP_COUNT(RP_COUNT),
-        .RX_DEPTH3(RX_DEPTH),
-        .RX_DEPTH4(RX_DEPTH)
+        .RX_DEPTH3(RDATA_DEPTH),
+        .RX_DEPTH4(WRESP_DEPTH)
     ) u_transport (
         .clk(clk),
         .rst_n(rst_n),
@@ -338,8 +353,8 @@ module axi2flit_soc #(
     // 仿真期检查 FIFO 深度；综合时排除。
 `ifndef SYNTHESIS
     initial begin
-        if (TX_DEPTH < 1 || RX_DEPTH < 1) begin
-            $fatal(1, "SoC FIFO depths must be positive");
+        if (TX_DEPTH < 1 || RDATA_DEPTH < 1 || WRESP_DEPTH < 1 || ID_CNT_WIDTH < 1) begin
+            $fatal(1, "SoC FIFO depths and ID counter width must be positive");
         end
     end
 `endif

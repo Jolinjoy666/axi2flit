@@ -5,14 +5,17 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include "link_config.h"
 
 struct BridgeTestConfig {
     std::string scenario="baseline", direction="both", package="S";
     unsigned burst=16, warmup=2000, cycles=20000, mc_latency=2, mc_interval=1;
     unsigned lanes=16, modules=1, credit_rtt_cycles=32;
-    double link_gbps=48, lane_gbps=32, shoreline_mm=0, density_gbps_mm=0;
+    // 链路速率默认取 link_config.h（x8、24 GT/s、PAM4 → 48 GB/s），消息区为其 240/256。
+    double link_gbps=LINK_BYTES_PER_NS, lane_gbps=32, shoreline_mm=0, density_gbps_mm=0;
     double phy_ns=2, prop_ns=0.2, cdc_ns=2, adapter_ns=0;
-    double target_gbps=45, min_efficiency=0;
+    double target_gbps=LINK_BYTES_PER_NS*240/256, min_efficiency=0;
+    int size=-1;   // 每拍传输大小 log2(字节)；-1 表示全宽
 
     bool physical() const { return scenario=="physical"; }
     bool paced() const { return scenario!="ideal"; }
@@ -24,8 +27,11 @@ struct BridgeTestConfig {
     void validate(unsigned bytes) const {
         if(scenario!="baseline" && scenario!="saturated" && scenario!="ideal" &&
            scenario!="physical" && scenario!="backpressure") throw std::runtime_error("unknown performance scenario");
-        if(direction!="read" && direction!="write" && direction!="both") throw std::runtime_error("invalid direction");
-        if(!burst || burst>256 || burst*bytes>4096 || !cycles || !warmup ||
+        if(direction!="read" && direction!="write" && direction!="both" && direction!="mixed")
+            throw std::runtime_error("invalid direction");
+        if(size>=0 && (1u<<size)>bytes) throw std::runtime_error("size exceeds bus width");
+        const unsigned beat=size<0 ? bytes : 1u<<size;
+        if(!burst || burst>256 || burst*beat>4096 || !cycles || !warmup ||
            !mc_latency || !mc_interval || !credit_rtt_cycles) throw std::runtime_error("invalid burst/window/MC/credit setting");
         for(double value:{link_gbps,lane_gbps,target_gbps})
             if(!std::isfinite(value)||value<=0) throw std::runtime_error("bandwidth must be finite and positive");
@@ -47,7 +53,9 @@ inline void bridge_help() {
     std::cout<<
         "Functional: --scenario functional|negative [--trace]\n"
         "Performance: --scenario baseline|saturated|ideal|physical|backpressure\n"
-        "  --direction read|write|both --burst N --warmup N --cycles N\n"
+        "  --direction read|write|both|mixed --burst N --size S --warmup N --cycles N\n"
+        "    size: 每拍传输大小 2^S 字节，默认全宽\n"
+        "    both: 读、写分别运行；mixed: 读写同时持续供数\n"
         "  --mc-latency N --mc-interval N --link-gbps B\n"
         "  --target-gbps B --min-efficiency 0..1 --credit-rtt-cycles N\n"
         "Physical: --package S|A --lanes 16|64 --modules N --lane-gbps B\n"
