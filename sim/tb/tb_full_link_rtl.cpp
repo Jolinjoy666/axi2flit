@@ -1,6 +1,8 @@
 /**
  * RTL 桥全链路联合仿真：AXI 主机模型 ⇄ RTL axi2flit_soc ⇄ UCIe 适配器 ⇄ UcieLink（训练、PHY、CRC、重放）
- *   ⇄ UCIe 适配器 ⇄ RTL flit2mc_target ⇄ MC 模型（读写分口，字节存储）。
+ *   ⇄ UCIe 适配器 ⇄ 存储侧 RTL ⇄ 控制器模型。
+ * 定义 FL_MC_HIF（默认构建）时存储侧为 flit2hif_target，HIF 控制器由 fl_rtl_top 内的 SV 模型建模，
+ * 本文件只控制它（stress）并读取统计；MC 存储比较改为模型自检 HIF 协议，端到端数据照常核对。
  * 同一份代码用 Verilator（--sc --pins-bv 2）或 VCS（-sysc，端口映射为 sc_bv）编译。
  * 记分板仅依据 AXI 握手维护参考字节，结束时与 MC 存储比较。
  * 用法：
@@ -10,6 +12,13 @@
  *   吞吐：<sim> --perf read|write|mixed（等价于 --case 13/14/15，另输出一行 FULL_LINK_PERF 供脚本解析）
  */
 #include "fl_rtl_dut.h"
+#ifdef FL_MC_HIF
+constexpr bool HIF = true;
+constexpr double HIF_GBPS = FL_HIF_DRAM_W * FL_HIF_RATIO * 2 / 8 / 2.0;   // HIF 数据口：每拍 CORE_DATA_WIDTH
+#else
+constexpr bool HIF = false;
+constexpr double HIF_GBPS = 1e9;
+#endif
 #include "axi_if.h"
 #include "aou_wire.h"
 #include "ucie_aou_adapter.h"
@@ -51,6 +60,11 @@
 #endif
 #ifndef FL_WDATA_DEPTH
 #define FL_WDATA_DEPTH 24
+#endif
+#ifndef FL_TX_DEPTH
+#define FL_TX_DEPTH 2
+#define FL_WR_ROUTE_DEPTH 8
+#define FL_RESPONSE_DEPTH 2
 #endif
 static_assert(FL_DATA_WIDTH == AXI_DATA_WIDTH, "RTL 与 SystemC 位宽配置不一致");
 constexpr unsigned BYTES = AXI_DATA_BYTES;
@@ -180,6 +194,11 @@ SC_MODULE(FullLinkRtlTb) {
     sc_signal<bool> wr_v{"wr_v"}, wr_r{"wr_r"}, wr_first{"wr_first"}, wr_last{"wr_last"}, wr_lock{"wr_lock"};
     sc_signal<bool> wrr_v{"wrr_v"}, wrr_r{"wrr_r"}, credit_wait{"credit_wait"};
     sc_signal<bv<8>> tb_case{"tb_case"};
+    // HIF 控制器模型（逐拍 MC 构建中恒为 0）。
+    sc_signal<bool> mc_block{"mc_block"}, mc_stress{"mc_stress"}, mc_model_error{"mc_model_error"};
+    sc_signal<bv<32>> mc_stat_rd{"mc_stat_rd"}, mc_stat_wr{"mc_stat_wr"}, mc_stat_ooo{"mc_stat_ooo"},
+                      mc_stat_interleave{"mc_stat_interleave"};
+    sc_signal<bv<3>> hif_obs{"hif_obs"};
 
     Stats stats;
     sc_fifo<FdiFlit> soc_tx, soc_rx, mem_tx, mem_rx;
@@ -233,6 +252,9 @@ SC_MODULE(FullLinkRtlTb) {
 
     void bind_dut() {
         dut.clk(clk); dut.rst_n(rst); dut.link_up(link_up); dut.tb_case(tb_case);
+        dut.mc_block(mc_block); dut.mc_stress(mc_stress); dut.mc_model_error(mc_model_error);
+        dut.mc_stat_rd(mc_stat_rd); dut.mc_stat_wr(mc_stat_wr); dut.mc_stat_ooo(mc_stat_ooo);
+        dut.mc_stat_interleave(mc_stat_interleave); dut.hif_obs(hif_obs);
         dut.s_axi_awvalid(awv); dut.s_axi_awready(awr); dut.s_axi_awaddr(awaddr); dut.s_axi_awid(awid);
         dut.s_axi_awlen(awlen); dut.s_axi_awsize(awsize); dut.s_axi_awburst(awburst); dut.s_axi_awprot(awprot);
         dut.s_axi_awcache(awcache); dut.s_axi_awqos(awqos); dut.s_axi_awlock(awlock); dut.s_axi_awuser(awuser);
@@ -290,18 +312,29 @@ private:
     uint64_t rd_lat_sum_ = 0, rd_lat_n_ = 0, rd_lat_max_ = 0, wr_lat_sum_ = 0, wr_lat_n_ = 0, wr_lat_max_ = 0;
     // 空载延迟测量：依次等待 8 个事件，记录各自的周期。-1 未启用，-2 完成。
     int probe_step_ = -1;
-    bool probe_write_ = false;
+    bool probe_write_ = false, probe_seen4_ = false;
     uint64_t probe_t_[8] = {};
     static bool has_msg(const bv<2000>& v) { return bits_flit(v).msg_start != 0; }
     void probe_edge() {
         const bool w = probe_write_;
         bool ev = false;
+        // HIF：一拍可能对应多条命令，“控制器”段到最后一行数据的末拍为止（该拍之后才轮到桥），
+        // 即一直更新第 4 个时间点，直到存储侧送出响应帧。
+        if (HIF && probe_step_ == 4) {
+            if (hif_obs.read()[w ? 2 : 1].to_bool()) { probe_t_[4] = cycle; probe_seen4_ = true; }
+            if (probe_seen4_ && t_txv.read() && t_txr.read() && has_msg(t_txd.read())) {
+                probe_t_[5] = cycle; probe_step_ = 6;
+            }
+            return;
+        }
         switch (probe_step_) {
         case 0: ev = w ? wv.read() && wr.read() && wlast.read() : arv.read() && arr.read(); break;   // AXI 请求/最后一拍写数据
         case 1: ev = s_txv.read() && s_txr.read() && has_msg(s_txd.read()); break;                   // SoC 桥送出帧
         case 2: ev = t_rxv.read() && t_rxr.read() && has_msg(t_rxd.read()); break;                   // 存储侧桥收到帧
-        case 3: ev = w ? wr_v.read() && wr_r.read() : rd_v.read() && rd_r.read(); break;             // MC 命令握手
-        case 4: ev = w ? wrr_v.read() && wrr_r.read() : rdr_v.read() && rdr_r.read(); break;         // MC 完成握手
+        // MC 命令握手 / MC 完成握手；HIF 为第一条命令被接收 / 第一行读数据末拍或写数据末拍被接收。
+        case 3: ev = HIF ? hif_obs.read()[0].to_bool() : w ? wr_v.read() && wr_r.read() : rd_v.read() && rd_r.read(); break;
+        case 4: ev = HIF ? hif_obs.read()[w ? 2 : 1].to_bool()
+                         : w ? wrr_v.read() && wrr_r.read() : rdr_v.read() && rdr_r.read(); break;
         case 5: ev = t_txv.read() && t_txr.read() && has_msg(t_txd.read()); break;                   // 存储侧桥送出响应帧
         case 6: ev = s_rxv.read() && s_rxr.read() && has_msg(s_rxd.read()); break;                   // SoC 桥收到响应帧
         case 7: ev = w ? bv_.read() && br.read() : rv.read() && rr.read() && rlast.read(); break;    // AXI 响应握手
@@ -325,7 +358,7 @@ private:
     static unsigned status(const AxChannel& a) {
         const uint64_t len = (uint64_t(a.len) + 1) << a.size;
         if (a.addr < BASE || a.addr - BASE >= MEM_SIZE || len > MEM_SIZE - (a.addr - BASE)) return 3;
-        return a.lock ? 2 : 0;
+        return a.lock && !HIF ? 2 : 0;   // HIF 不支持独占，按普通访问返回 OKAY
     }
     static uint64_t u64(const bv<64>& v) { return v.to_uint64(); }
 
@@ -420,7 +453,13 @@ private:
                 }
             }
             if (probe_step_ >= 0) probe_edge();
-            mc_edge();
+            if (HIF) {
+                check(!mc_model_error.read(), "HIF controller model reported a protocol violation");
+                mc_ooo = mc_stat_ooo.read().to_uint64(); mc_rd_cmds = mc_stat_rd.read().to_uint64();
+                mc_wr_cmds = mc_stat_wr.read().to_uint64(); mc_cmds = mc_rd_cmds + mc_wr_cmds;
+            } else {
+                mc_edge();
+            }
         }
     }
 
@@ -480,6 +519,7 @@ private:
             if (hold_r_) --hold_r_;
             rd_r.write(!stress || cycle % 9 >= 3);
             wr_r.write(!stress || cycle % 7 >= 2);
+            mc_stress.write(stress);
             auto pick = [&](std::vector<McPending>& list) {
                 int s = -1;
                 for (unsigned i = 0; i < list.size(); ++i) if (list[i].due <= cycle) { s = int(i); if (!stress) break; }
@@ -515,18 +555,44 @@ private:
         until([&] { return (read ? ar_count : aw_count) > before; }, "AXI address timeout");
         (read ? arv : awv).write(false);
     }
+    void drive_w(const AxChannel& a, unsigned n, unsigned salt, unsigned mask) {
+        const uint64_t addr = a.addr + (uint64_t(n) << a.size);
+        const unsigned lane = unsigned(addr % BYTES);
+        uint8_t d[BYTES], s[BYTES];
+        for (unsigned j = 0; j < BYTES; ++j) {
+            d[j] = uint8_t(salt + n * 37 + j * 13 + (j >> 3));
+            s[j] = j >= lane && j < lane + (1u << a.size) && (mask == 0 || (mask == 1 && j % 3 != 1));
+        }
+        wdata.write(from_bytes<FL_DATA_WIDTH>(d)); wstrb.write(from_bits<FL_DATA_WIDTH / 8>(s));
+        wlast.write(n == a.len); wuser.write(0x5100 | n);
+    }
+    // AW、AR、W 三个通道各自推进：AXI 规定主机不得等 AWREADY 才给出 WVALID，从机何时接受由 RTL 决定。
+    // gaps 为真时在 W 拍之间随机插入 0～3 拍空闲；VALID 一旦拉高保持到握手。
+    void send_overlapped(const std::vector<AxChannel>& writes, const std::vector<unsigned>& salts,
+                         const std::vector<AxChannel>& reads, bool gaps) {
+        size_t ai = 0, ri = 0, wi = 0; unsigned beat = 0, idle = gaps ? stim_rng_() % 4 : 0;
+        for (unsigned n = 0; ai < writes.size() || ri < reads.size() || wi < writes.size(); ++n) {
+            if (n >= 400000) throw std::runtime_error("AXI overlapped write timeout");
+            awv.write(ai < writes.size()); if (ai < writes.size()) drive_ax(writes[ai], false);
+            arv.write(ri < reads.size()); if (ri < reads.size()) drive_ax(reads[ri], true);
+            const bool w_on = wi < writes.size() && idle == 0;
+            wv.write(w_on); if (w_on) drive_w(writes[wi], beat, salts[wi], 0);
+            const auto aw0 = aw_count, ar0 = ar_count, w0 = w_count;
+            tick();
+            if (aw_count > aw0) ++ai;
+            if (ar_count > ar0) ++ri;
+            if (idle) --idle;
+            if (w_count > w0) {
+                if (beat == writes[wi].len) { ++wi; beat = 0; } else ++beat;
+                idle = gaps ? stim_rng_() % 4 : 0;
+            }
+        }
+        awv.write(false); arv.write(false); wv.write(false);
+    }
     void send_data(const AxChannel& a, unsigned salt, unsigned mask = 0, bool gaps = false) {
         for (unsigned n = 0; n <= a.len; ++n) {
             if (gaps) cycles(stim_rng_() % 4);
-            const uint64_t addr = a.addr + (uint64_t(n) << a.size);
-            const unsigned lane = unsigned(addr % BYTES);
-            uint8_t d[BYTES], s[BYTES];
-            for (unsigned j = 0; j < BYTES; ++j) {
-                d[j] = uint8_t(salt + n * 37 + j * 13 + (j >> 3));
-                s[j] = j >= lane && j < lane + (1u << a.size) && (mask == 0 || (mask == 1 && j % 3 != 1));
-            }
-            wdata.write(from_bytes<FL_DATA_WIDTH>(d)); wstrb.write(from_bits<FL_DATA_WIDTH / 8>(s));
-            wlast.write(n == a.len); wuser.write(0x5100 | n);
+            drive_w(a, n, salt, mask);
             const auto before = w_count; wv.write(true);
             until([&] { return w_count > before; }, "AXI W timeout");
             wv.write(false);
@@ -567,14 +633,14 @@ private:
     void latency_probe() {
         tb_case.write(CASE_PROBE);
         const unsigned saved = mc_latency_; mc_latency_ = 10;
-        probe_write_ = false; probe_step_ = 0;
+        probe_write_ = false; probe_seen4_ = false; probe_step_ = 0;
         send_address(address(250, 0x1E000, 1), true); drain();
         until([&] { return probe_step_ == -2; }, "latency probe (read) timeout");
         std::copy(probe_t_, probe_t_ + 8, probe_rd);
         cycles(50);
         const auto a = address(251, 0x1E000, 1);
         send_address(a, false); cycles(50);
-        probe_write_ = true; probe_step_ = 0;
+        probe_write_ = true; probe_seen4_ = false; probe_step_ = 0;
         send_data(a, 0x77); drain();
         until([&] { return probe_step_ == -2; }, "latency probe (write) timeout");
         std::copy(probe_t_, probe_t_ + 8, probe_wr);
@@ -604,9 +670,12 @@ private:
             auto high = address(8, 0x1000, 1); high.addr += 1ULL << 32; write_read(high, 0xF2);
         });
         run_case(9, "multiple AW, mixed outstanding reads/writes, multiple RP", [&] {
-            std::vector<AxChannel> jobs;
-            for (unsigned i = 0; i < 8; ++i) { jobs.push_back(address(32 + i, 0x9000 + i * 256, 2)); send_address(jobs.back(), false); }
-            for (unsigned i = 0; i < 8; ++i) { send_address(address(64 + i, 0, 2), true); send_data(jobs[i], 0x60 + i, 0, true); }
+            std::vector<AxChannel> jobs, reads; std::vector<unsigned> salts;
+            for (unsigned i = 0; i < 8; ++i) {
+                jobs.push_back(address(32 + i, 0x9000 + i * 256, 2)); salts.push_back(0x60 + i);
+                reads.push_back(address(64 + i, 0, 2));
+            }
+            send_overlapped(jobs, salts, reads, true);
             drain();
             for (auto a : jobs) send_address(a, true);
         });
@@ -664,7 +733,8 @@ private:
             if (ar_count > ar0) ++rseq;
         };
         for (unsigned n = 0; n < perf_warmup; ++n) pump(true);
-        const auto r0 = r_count, b0 = b_count, c0 = cycle, cw0 = credit_wait_cycles;
+        // 读按 R 握手、写按 W 握手计字节：逐拍计数，统计窗边界误差不超过一拍（按 B 计会差整笔突发）。
+        const auto r0 = r_count, w0c = w_count, c0 = cycle, cw0 = credit_wait_cycles;
         const auto f0 = stats.forward.tx_new_flits, v0 = stats.reverse.tx_new_flits;
         constexpr unsigned WIN = 1000;
         double rmin = 1e9, rmax = 0, wmin = 1e9, wmax = 0;
@@ -678,7 +748,7 @@ private:
             }
         }
         const double ns = double(cycle - c0) * 2;
-        const double rgb = double(r_count - r0) * BYTES / ns, wgb = double(b_count - b0) * BYTES * perf_burst / ns;
+        const double rgb = double(r_count - r0) * BYTES / ns, wgb = double(w_count - w0c) * BYTES / ns;
         const auto ff = stats.forward.tx_new_flits - f0, rf = stats.reverse.tx_new_flits - v0;
         const auto cw = credit_wait_cycles - cw0;
         awv.write(false); arv.write(false);
@@ -710,7 +780,7 @@ private:
                                rd_pend_.empty() && wr_pend_.empty(); }, "link drain timeout");
             cycles(1000);
             for (const auto& [addr, byte] : reference_)
-                if (addr >= BASE && addr - BASE < MEM_SIZE && storage_[addr - BASE] != byte) {
+                if (!HIF && addr >= BASE && addr - BASE < MEM_SIZE && storage_[addr - BASE] != byte) {
                     check(false, "reference and MC storage differ"); break;
                 }
             if (only_cases.empty()) {
@@ -742,17 +812,27 @@ static std::string fmt(const char* f, double a, double b = 0) {
 static void report(const FullLinkRtlTb& tb, const Config& cfg, bool stress, bool replay, double wall_s) {
     const double raw = cfg.num_lanes * cfg.lane_rate_gtps * cfg.bits_per_ui() / 8;   // GB/s
     const double payload = raw * 240 / 256;   // 扣除 Flit 头、CRC 与协议头后的消息区带宽
-    const double port = BYTES / 2.0;          // AXI 端口带宽：每拍 BYTES 字节，2 ns 一拍
+    // 桥一侧的上限：AXI 端口每拍 BYTES 字节（2 ns 一拍）；HIF 构建再受 HIF 数据口限制。
+    const double port = std::min(BYTES / 2.0, HIF_GBPS);
     auto u = [](uint64_t v) { return (unsigned long long)v; };
     std::printf("\n============ 全链路仿真  DATA_WIDTH=%u  RP=%u%s%s ============\n", AXI_DATA_WIDTH, FL_RP_COUNT,
                 stress ? "  压力模式" : "", replay ? "  CRC 错误注入 2%" : "");
-    std::printf("配置  x%u @ %.0f GT/s %s，消息区 %.0f GB/s；深度 RDATA/WRESP %d/%d，WREQ/RREQ/WDATA %d/%d/%d；MC_SLOTS %d，MC 延迟 10 拍\n",
-                cfg.num_lanes, cfg.lane_rate_gtps, cfg.bits_per_ui() == 2 ? "PAM4" : "NRZ", payload, FL_RDATA_DEPTH, FL_WRESP_DEPTH,
-                FL_WREQ_DEPTH, FL_RREQ_DEPTH, FL_WDATA_DEPTH, FL_MC_SLOTS);
+    std::printf("配置  x%u @ %.0f GT/s %s，消息区 %.0f GB/s；深度 TX %d、写路由 %d、RESPONSE %d，"
+                "RDATA/WRESP %d/%d，WREQ/RREQ/WDATA %d/%d/%d；",
+                cfg.num_lanes, cfg.lane_rate_gtps, cfg.bits_per_ui() == 2 ? "PAM4" : "NRZ", payload, FL_TX_DEPTH,
+                FL_WR_ROUTE_DEPTH, FL_RESPONSE_DEPTH, FL_RDATA_DEPTH, FL_WRESP_DEPTH,
+                FL_WREQ_DEPTH, FL_RREQ_DEPTH, FL_WDATA_DEPTH);
+#ifdef FL_MC_HIF
+    std::printf("存储侧 HIF %d 位、每条命令 %dB，credit LPR/HPR/WR %d/%d/%d，控制器延迟 %d 拍\n",
+                FL_HIF_DRAM_W * FL_HIF_RATIO * 2, FL_HIF_BL * FL_HIF_DRAM_W / 8, FL_HIF_LPR, FL_HIF_HPR, FL_HIF_WR,
+                FL_HIF_LATENCY);
+#else
+    std::printf("MC_SLOTS %d，MC 延迟 10 拍\n", FL_MC_SLOTS);
+#endif
 
     if (!tb.rows.empty()) {
-        std::printf("%s%s%s%s%s%s\n", pad("用例", 36).c_str(), pad("用时ns", 9).c_str(), pad("写 笔/拍", 11).c_str(),
-                    pad("读 笔/拍", 11).c_str(), pad("读延迟ns 均/大", 16).c_str(), "写延迟ns 均/大");
+        std::printf("%s%s%s%s%s%s\n", pad("用例", 36).c_str(), pad("时长ns", 9).c_str(), pad("写 突发/拍", 11).c_str(),
+                    pad("读 突发/拍", 11).c_str(), pad("读延迟ns 均/大", 16).c_str(), "写延迟ns 均/大");
         for (const auto& r : tb.rows) {
             char wb[32], rb[32];
             std::snprintf(wb, sizeof wb, "%llu/%llu", u(r.aw), u(r.w));
@@ -768,8 +848,10 @@ static void report(const FullLinkRtlTb& tb, const Config& cfg, bool stress, bool
     if (tb.probe_done) {
         auto row = [&](const char* head, const char* name, const uint64_t* t) {
             auto d = [&](int a, int b) { return 2.0 * double(t[b] - t[a]); };
-            std::printf("%s%s %3.0f ns = SoC发送 %.0f + 链路 %.0f + 存储侧请求 %.0f + MC %.0f + 存储侧返回 %.0f + 链路 %.0f + SoC接收 %.0f\n",
-                        head, name, d(0, 7), d(0, 1), d(1, 2), d(2, 3), d(3, 4), d(4, 5), d(5, 6), d(6, 7));
+            // HIF 构建中“控制器”段为第一条命令到最后一行数据末拍（含多行数据的传输）。
+            std::printf("%s%s %3.0f ns = SoC发送 %.0f + 链路 %.0f + 存储侧请求 %.0f + %s %.0f + 存储侧返回 %.0f + 链路 %.0f + SoC接收 %.0f\n",
+                        head, name, d(0, 7), d(0, 1), d(1, 2), d(2, 3), HIF ? "HIF 控制器" : "MC", d(3, 4), d(4, 5),
+                        d(5, 6), d(6, 7));
             soc_lat = std::max(soc_lat, d(0, 1) + d(6, 7));
             tgt_lat = std::max(tgt_lat, d(2, 3) + d(4, 5));
         };
@@ -794,15 +876,18 @@ static void report(const FullLinkRtlTb& tb, const Config& cfg, bool stress, bool
 
     std::printf("指标  速率 %.0f GT/s", cfg.lane_rate_gtps);
     if (umin < 1e9) std::printf(" | 带宽利用率 %.1f%%%s", umin * 100,
-                                port < payload ? fmt("（受 %.0f GB/s 端口限制）", port).c_str() : "");
+                                port < payload ? fmt(HIF_GBPS < BYTES / 2.0 ? "（受 %.0f GB/s HIF 数据口限制）"
+                                                                            : "（受 %.0f GB/s 端口限制）", port).c_str() : "");
     if (tb.probe_done) std::printf(" | 桥延迟 SoC 侧 %.0f ns、存储侧 %.0f ns", soc_lat, tgt_lat);
     std::printf("\n");
-    std::printf("统计  写 %llu/%llu、读 %llu/%llu（笔/拍），MC 乱序 %llu，链路帧 %llu/%llu，CRC 错误 %llu，重传 %llu，数据错误 %u\n",
-                u(tb.aw_count), u(tb.w_count), u(tb.ar_count), u(tb.r_count), u(tb.mc_ooo),
+    std::printf("统计  写 %llu 突发 %llu 拍、读 %llu 突发 %llu 拍，%s %llu，链路帧 %llu/%llu，CRC 错误 %llu，重传 %llu，数据错误 %u\n",
+                u(tb.aw_count), u(tb.w_count), u(tb.ar_count), u(tb.r_count),
+                HIF ? ("HIF 命令 读 " + std::to_string(tb.mc_rd_cmds) + " 写 " + std::to_string(tb.mc_wr_cmds) +
+                       "，乱序返回").c_str() : "MC 乱序", u(tb.mc_ooo),
                 u(tb.stats.forward.tx_new_flits), u(tb.stats.reverse.tx_new_flits),
                 u(tb.stats.forward.crc_fail_count + tb.stats.reverse.crc_fail_count),
                 u(tb.stats.forward.tx_replay_flits + tb.stats.reverse.tx_replay_flits), tb.failures);
-    std::printf("用时  仿真 %.1f us，运行 %.1f s\n", tb.cycle * 2 / 1000.0, wall_s);
+    std::printf("用时  硬件时间 %.1f us（被仿真电路经过的时间），本机运行 %.1f s\n", tb.cycle * 2 / 1000.0, wall_s);
     if (tb.failures) std::printf("FAIL  %u 处错误，详见上方 [FAIL] 行\n", tb.failures);
 }
 

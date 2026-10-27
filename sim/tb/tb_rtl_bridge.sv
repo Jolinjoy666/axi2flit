@@ -1,20 +1,35 @@
 // 仅用于验证的装配顶层：SoC RTL ↔ 两个有限 Flit FIFO ↔ Target RTL。
-// 主机激励、MC 字节存储、乱序响应、独立记分板位于同目录的 C++ testbench。
+// 主机激励与独立记分板位于同目录的 C++ testbench。存储侧二选一（sim/Makefile 的 MC_IF）：
+//   TB_MC_HIF（MC_IF=hif，默认）：交付设计 flit2hif_target，控制器由本模块内的 hif_mc_model 建模，
+//     C++ 只通过 mc_block/mc_stress 控制它并读取统计；
+//   否则（MC_IF=ideal）：满速 MC 模型 sim/model/flit2mc_target.sv，MC 字节存储与乱序响应由 C++ 建模。
+//   两种情况端口相同，未用的一组恒为 0。
 // forward_enable/reverse_enable 只限制入链路握手，FIFO 内已接受数据不会被撤销。
 module tb_rtl_bridge #(
     parameter int DATA_WIDTH=256, RP_COUNT=1,
     parameter int LINK_DEPTH=64,
-    parameter int TX_DEPTH=8,
+    parameter int TX_DEPTH=2,
+    parameter int WR_ROUTE_DEPTH=8,
+    parameter int RD_OUTSTANDING=32,
+    parameter int WR_OUTSTANDING=32,
     parameter int RDATA_DEPTH=24,
     parameter int WRESP_DEPTH=24,
     parameter int WREQ_DEPTH=24,
     parameter int RREQ_DEPTH=32,
     parameter int WDATA_DEPTH=24,
-    parameter int RESPONSE_DEPTH=8,
+    parameter int RESPONSE_DEPTH=2,
     parameter int MC_RD_SLOTS=16,
     parameter int MC_WR_SLOTS=16,
     parameter int RD_TAG_WIDTH=MC_RD_SLOTS > 1 ? $clog2(MC_RD_SLOTS) : 1,
-    parameter int WR_TAG_WIDTH=MC_WR_SLOTS > 1 ? $clog2(MC_WR_SLOTS) : 1
+    parameter int WR_TAG_WIDTH=MC_WR_SLOTS > 1 ? $clog2(MC_WR_SLOTS) : 1,
+    // HIF 后端与控制器模型的配置（仅 TB_MC_HIF 时使用）。
+    parameter int HIF_DRAM_W=32, HIF_RATIO=4, HIF_BL=16,
+    parameter int HIF_RD_LINES=32, HIF_WR_LINES=16,
+    parameter int HIF_LPR=24, HIF_HPR=8, HIF_WR=32, HIF_CREDIT_BITS=1,
+    parameter bit HIF_ECC_RMW=1'b0,
+    parameter int HIF_HPR_QOS=2, HIF_LATENCY=8,   // 用例的 QoS 取 0～3，≥2 的读走 HPR
+    parameter int HIF_MEM_BYTES=128*1024,        // 控制器模型的存储容量，超出报 addr_err
+    parameter int HIF_POISON=20480+DATA_WIDTH/8  // 该偏移所在行读出时报 ECC 错误
 ) (
     input logic clk,rst_n,link_up,forward_enable,reverse_enable,
     input logic forward_deliver,reverse_deliver,
@@ -68,38 +83,76 @@ module tb_rtl_bridge #(
     output logic [13:0] perf_stall,
     output logic [15:0] perf_rob_level,
     // 存储侧 WREQ 可发 credit，供 credit 饱和测试观察。
-    output logic [11:0] target_wreq_available
+    output logic [11:0] target_wreq_available,
+    // HIF 控制器模型的控制与统计；hif_obs 为 {写数据末拍接收, 读数据末拍, 命令接收}，用于测延迟。
+    input logic mc_block,mc_stress,mc_inject_bad_token,
+    output logic mc_model_error,
+    output logic [31:0] mc_stat_rd,mc_stat_wr,mc_stat_ooo,mc_stat_interleave,mc_stat_stall,
+    output logic [2:0] hif_obs
 );
     import aou_pkg::*;
+`ifdef TB_MC_HIF
+    localparam int HIF_CORE_W = HIF_DRAM_W * HIF_RATIO * 2;
+    localparam int HIF_LINE_WORDS = HIF_BL * HIF_DRAM_W / HIF_CORE_W;
+    logic hif_cmd_valid, hif_cmd_stall, hif_cmd_autopre;
+    logic [1:0] hif_cmd_type, hif_cmd_pri, hif_wrecc_credit;
+    logic [39:0] hif_cmd_addr;
+    logic [52:0] hif_cmd_token, hif_rdata_token;
+    logic [1:0] hif_cmd_length;
+    logic [18:0] hif_cmd_wdata_ptr, hif_wdata_ptr;
+    logic [10:0] hif_cmd_latency;
+    logic [HIF_CREDIT_BITS-1:0] hif_lpr_credit, hif_hpr_credit;
+    logic hif_wr_credit, hif_rdata_valid, hif_rdata_end;
+    logic [HIF_CORE_W-1:0] hif_rdata, hif_wdata;
+    logic [HIF_CORE_W/8-1:0] hif_wdata_mask;
+    logic hif_rdata_uncorr_ecc_err, hif_rdata_addr_err, hif_rdata_crc_err;
+    logic hif_wdata_valid, hif_wdata_end, hif_wdata_stall, hif_wdata_ptr_valid, hif_wdata_ptr_addr_err;
+    logic hif_go2critical_lpr, hif_go2critical_hpr, hif_go2critical_wr;
+`endif
     logic fq_ready,rq_ready,fq_valid,rq_valid,fq_full,rq_full,fq_empty,rq_empty;
     flit_t fq_data,rq_data;
     always_comb begin
         perf_stall = '0;
         perf_stall[0] = soc.u_transport.raw_valid && !soc.u_transport.raw_ready;
-        perf_stall[1] = target.u_transport.raw_valid && !target.u_transport.raw_ready;
+        perf_stall[1] = target.u_core.u_transport.raw_valid && !target.u_core.u_transport.raw_ready;
         for (int p = 0; p < RP_COUNT; p++) begin
             for (int k = 0; k < MSG_KIND_COUNT; k++) begin
                 perf_stall[2] |= soc.tx_valid[p][k] &&
-                    int'(soc.u_transport.available[p][k]) < granules(soc.tx_data[p][k][1199:1192]);
-                perf_stall[3] |= target.tx_valid[p][k] &&
-                    int'(target.u_transport.available[p][k]) < granules(target.tx_data[p][k][1199:1192]);
+                    int'(soc.u_transport.available[p][k]) < msg_granules(soc.tx_data[p][k]);
+                perf_stall[3] |= target.u_core.tx_valid[p][k] &&
+                    int'(target.u_core.u_transport.available[p][k]) < msg_granules(target.u_core.tx_data[p][k]);
             end
         end
+`ifdef TB_MC_HIF
+        perf_stall[4] = target.rob_count == HIF_RD_LINES || target.free_count == 0;
+        perf_stall[5] = target.rc_count != 0 && !target.rt_ready;
+        perf_stall[6] = target.rt_ready && !target.rt_fire;
+`else
         perf_stall[4] = target.rd_count == MC_RD_SLOTS || target.wr_count == MC_WR_SLOTS;
         perf_stall[5] = (target.rd_count != 0 && !target.rd_completed[target.rd_head]) ||
                         (target.wr_count != 0 && !target.wr_completed[target.wr_head]);
         perf_stall[6] = (target.rd_count != 0 && target.rd_completed[target.rd_head] && !target.rd_retire) ||
                         (target.wr_count != 0 && target.wr_completed[target.wr_head] && !target.wr_retire);
+`endif
         perf_stall[7] = soc_rx_valid && !soc_rx_ready;
         perf_stall[8] = target_rx_valid && !target_rx_ready;
         perf_stall[9] = fwd_valid && !fwd_ready;
         perf_stall[10] = rev_valid && !rev_ready;
+`ifdef TB_MC_HIF
+        perf_stall[11] = hif_cmd_valid && hif_cmd_stall;
+        perf_stall[12] = !hif_cmd_valid;
+`else
         perf_stall[11] = (mc_rd_valid && !mc_rd_ready) || (mc_wr_valid && !mc_wr_ready);
         perf_stall[12] = !mc_rd_valid && !mc_wr_valid;
+`endif
         perf_stall[13] = s_axi_rvalid && !s_axi_rready;
     end
+`ifdef TB_MC_HIF
+    assign perf_rob_level = 16'(target.rob_count) + 16'(HIF_WR_LINES - int'(target.free_count));
+`else
     assign perf_rob_level = 16'(target.rd_count) + 16'(target.wr_count);
-    assign target_wreq_available = target.u_transport.available[0][0];
+`endif
+    assign target_wreq_available = target.u_core.u_transport.available[0][0];
     assign fwd_ready=fq_ready && forward_enable;
     assign rev_ready=rq_ready && reverse_enable;
     aou_sync_fifo #(
@@ -143,12 +196,70 @@ module tb_rtl_bridge #(
         .DATA_WIDTH(DATA_WIDTH),
         .RP_COUNT(RP_COUNT),
         .TX_DEPTH(TX_DEPTH),
+        .WR_ROUTE_DEPTH(WR_ROUTE_DEPTH),
+        .RD_OUTSTANDING(RD_OUTSTANDING),
+        .WR_OUTSTANDING(WR_OUTSTANDING),
         .RDATA_DEPTH(RDATA_DEPTH),
         .WRESP_DEPTH(WRESP_DEPTH)
     ) soc (
         .flit_tx_valid(fwd_valid),.flit_tx_ready(fwd_ready),.flit_tx_data(fwd_data),
         .flit_rx_valid(soc_rx_valid),.flit_rx_ready(soc_rx_ready),.flit_rx_data(soc_rx_data),
         .protocol_error(soc_error),.*);
+`ifdef TB_MC_HIF
+    // 桥的地址窗口取模型容量的两倍：窗口内越界由控制器报 addr_err，窗口外由桥直接回 DECERR。
+    flit2hif_target #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .RP_COUNT(RP_COUNT),
+        .WREQ_DEPTH(WREQ_DEPTH),
+        .RREQ_DEPTH(RREQ_DEPTH),
+        .WDATA_DEPTH(WDATA_DEPTH),
+        .RESPONSE_DEPTH(RESPONSE_DEPTH),
+        .MEMC_DRAM_DATA_WIDTH(HIF_DRAM_W),
+        .MEMC_FREQ_RATIO(HIF_RATIO),
+        .MEMC_BURST_LENGTH(HIF_BL),
+        .HIF_CREDIT_BITS(HIF_CREDIT_BITS),
+        .LPR_CREDITS(HIF_LPR),
+        .HPR_CREDITS(HIF_HPR),
+        .WR_CREDITS(HIF_WR),
+        .ECC_RMW(HIF_ECC_RMW),
+        .ADDR_BASE(64'h1234567800000000),
+        .MEM_BYTES(64'(2 * HIF_MEM_BYTES)),
+        .HPR_QOS(HIF_HPR_QOS),
+        .RD_LINES(HIF_RD_LINES),
+        .WR_LINES(HIF_WR_LINES)
+    ) target (
+        .clk(clk),.rst_n(rst_n),.link_up(link_up),
+        .flit_tx_valid(rev_valid),.flit_tx_ready(rev_ready),.flit_tx_data(rev_data),
+        .flit_rx_valid(target_rx_valid),.flit_rx_ready(target_rx_ready),.flit_rx_data(target_rx_data),
+        .protocol_error(target_error),.*);
+    hif_mc_model #(
+        .CORE_DATA_WIDTH(HIF_CORE_W),
+        .LINE_WORDS(HIF_LINE_WORDS),
+        .WORD_BYTES(HIF_DRAM_W / 8),
+        .HIF_CREDIT_BITS(HIF_CREDIT_BITS),
+        .LPR_CREDITS(HIF_LPR),
+        .HPR_CREDITS(HIF_HPR),
+        .WR_CREDITS(HIF_WR),
+        .MEM_BYTES(HIF_MEM_BYTES),
+        .POISON_LINE(HIF_POISON),
+        .LATENCY(HIF_LATENCY)
+    ) u_mc (
+        .block(mc_block),.stress(mc_stress),.inject_bad_token(mc_inject_bad_token),
+        .model_error(mc_model_error),.stat_rd(mc_stat_rd),.stat_wr(mc_stat_wr),.stat_ooo(mc_stat_ooo),
+        .stat_interleave(mc_stat_interleave),.stat_stall(mc_stat_stall),.*);
+    assign hif_obs = {hif_wdata_valid && !hif_wdata_stall && hif_wdata_end,
+                      hif_rdata_valid && hif_rdata_end, hif_cmd_valid && !hif_cmd_stall};
+    // 逐拍 MC 接口在 HIF 构建中不使用。
+    assign {mc_rd_valid,mc_rd_tag,mc_rd_rp,mc_rd_id,mc_rd_addr,mc_rd_size,mc_rd_len,mc_rd_beat,mc_rd_first,mc_rd_last,
+            mc_rd_prot,mc_rd_cache,mc_rd_qos,mc_rd_lock,mc_rd_user,mc_rd_rsp_ready} = '0;
+    assign {mc_wr_valid,mc_wr_tag,mc_wr_rp,mc_wr_id,mc_wr_addr,mc_wr_size,mc_wr_len,mc_wr_beat,mc_wr_first,mc_wr_last,
+            mc_wr_prot,mc_wr_cache,mc_wr_qos,mc_wr_lock,mc_wr_user,mc_wr_wuser,mc_wr_data,mc_wr_strb,mc_wr_rsp_ready} = '0;
+    assert property (@(posedge clk) disable iff(!rst_n)
+        hif_cmd_valid && hif_cmd_stall |=> hif_cmd_valid && $stable({hif_cmd_type,hif_cmd_addr,hif_cmd_pri,
+          hif_cmd_token,hif_cmd_length,hif_cmd_wdata_ptr}));
+    assert property (@(posedge clk) disable iff(!rst_n)
+        hif_wdata_valid && hif_wdata_stall |=> hif_wdata_valid && $stable({hif_wdata,hif_wdata_mask,hif_wdata_end}));
+`else
     flit2mc_target #(
         .DATA_WIDTH(DATA_WIDTH),
         .RP_COUNT(RP_COUNT),
@@ -164,7 +275,9 @@ module tb_rtl_bridge #(
         .flit_tx_valid(rev_valid),.flit_tx_ready(rev_ready),.flit_tx_data(rev_data),
         .flit_rx_valid(target_rx_valid),.flit_rx_ready(target_rx_ready),.flit_rx_data(target_rx_data),
         .protocol_error(target_error),.*);
+    assign {mc_model_error,mc_stat_rd,mc_stat_wr,mc_stat_ooo,mc_stat_interleave,mc_stat_stall,hif_obs} = '0;
 
+`endif
     // 检查器不参与 DUT 数据通路。被背压的 valid 和完整载荷必须跨周期保持。
     assert property (@(posedge clk) disable iff(!rst_n)
         fwd_valid && !fwd_ready |=> fwd_valid && $stable(fwd_data));
@@ -185,6 +298,7 @@ module tb_rtl_bridge #(
         s_axi_rvalid && !s_axi_rready |=> s_axi_rvalid && $stable({s_axi_rdata,s_axi_rid,s_axi_rresp,s_axi_rlast,s_axi_ruser}));
     assert property (@(posedge clk) disable iff(!rst_n)
         s_axi_bvalid && !s_axi_bready |=> s_axi_bvalid && $stable({s_axi_bid,s_axi_bresp,s_axi_buser}));
+`ifndef TB_MC_HIF
     assert property (@(posedge clk) disable iff(!rst_n)
         mc_rd_valid && !mc_rd_ready |=> mc_rd_valid && $stable({mc_rd_tag,
           mc_rd_rp,mc_rd_id,mc_rd_addr,mc_rd_size,mc_rd_len,mc_rd_beat,mc_rd_first,mc_rd_last,
@@ -193,4 +307,5 @@ module tb_rtl_bridge #(
         mc_wr_valid && !mc_wr_ready |=> mc_wr_valid && $stable({mc_wr_tag,
           mc_wr_rp,mc_wr_id,mc_wr_addr,mc_wr_size,mc_wr_len,mc_wr_beat,mc_wr_first,mc_wr_last,
           mc_wr_prot,mc_wr_cache,mc_wr_qos,mc_wr_lock,mc_wr_user,mc_wr_wuser,mc_wr_data,mc_wr_strb}));
+`endif
 endmodule

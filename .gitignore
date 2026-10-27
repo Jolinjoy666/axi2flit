@@ -42,3 +42,6 @@ systemc/sim/perf_report.txt
 *.a
 __pycache__/
 doc/axi2flit_design/figures/
+
+# 设计文档的图片与结果数据由 doc/设计文档/src/build.sh 生成
+doc/设计文档/figures/

@@ -1,4 +1,6 @@
-// 存储侧响应端：AoU Flit→逐拍 MC 命令，MC 完成→RDATA/WRESP。
+// 仿真用的满速 MC 模型（MC_IF=ideal）：与 flit2hif_target 共用 aou_target_core，后端换成逐拍 MC 接口，
+// 由测试平台的字节存储模型立即响应。用于测量“桥 + 链路”本身的带宽与延迟上限，不属于交付 RTL。
+// AoU Flit→逐拍 MC 命令，MC 完成→RDATA/WRESP。
 // 读、写各有一组命令口和完成口，每拍可各发一条命令。一条命令表示一个 AXI beat：
 // addr 为本拍字节地址，size 决定访问范围；写数据复制到整条总线，选通只在本拍所在通道组。
 // first/last/len/beat 保留原 burst 上下文。MC 必须为每条命令返回一次带 tag 的完成。
@@ -12,7 +14,7 @@ module flit2mc_target #(
     parameter int WREQ_DEPTH = 24,
     parameter int RREQ_DEPTH = 32,
     parameter int WDATA_DEPTH = 24,
-    parameter int RESPONSE_DEPTH = 8,
+    parameter int RESPONSE_DEPTH = 2,
     parameter int MC_RD_SLOTS = 16,
     parameter int MC_WR_SLOTS = 16,
     parameter int RD_TAG_WIDTH = MC_RD_SLOTS > 1 ? $clog2(MC_RD_SLOTS) : 1,
@@ -35,9 +37,9 @@ module flit2mc_target #(
     output logic mc_rd_valid,
     input logic mc_rd_ready,
     output logic [RD_TAG_WIDTH-1:0] mc_rd_tag,
-    output logic [1:0] mc_rd_rp,
-    output logic [9:0] mc_rd_id,
-    output logic [63:0] mc_rd_addr,
+    output logic [aou_pkg::RP_W-1:0] mc_rd_rp,
+    output logic [aou_pkg::WIRE_ID_W-1:0] mc_rd_id,
+    output logic [aou_pkg::WIRE_ADDR_W-1:0] mc_rd_addr,
     output logic [2:0] mc_rd_size,
     output logic [7:0] mc_rd_len,
     output logic [7:0] mc_rd_beat,
@@ -47,7 +49,7 @@ module flit2mc_target #(
     output logic [3:0] mc_rd_cache,
     output logic [3:0] mc_rd_qos,
     output logic mc_rd_lock,
-    output logic [15:0] mc_rd_user,
+    output logic [aou_pkg::WIRE_USER_W-1:0] mc_rd_user,
     // MC 读完成：每条读命令回送一次，tag 用于重排。
     input logic mc_rd_rsp_valid,
     output logic mc_rd_rsp_ready,
@@ -59,9 +61,9 @@ module flit2mc_target #(
     output logic mc_wr_valid,
     input logic mc_wr_ready,
     output logic [WR_TAG_WIDTH-1:0] mc_wr_tag,
-    output logic [1:0] mc_wr_rp,
-    output logic [9:0] mc_wr_id,
-    output logic [63:0] mc_wr_addr,
+    output logic [aou_pkg::RP_W-1:0] mc_wr_rp,
+    output logic [aou_pkg::WIRE_ID_W-1:0] mc_wr_id,
+    output logic [aou_pkg::WIRE_ADDR_W-1:0] mc_wr_addr,
     output logic [2:0] mc_wr_size,
     output logic [7:0] mc_wr_len,
     output logic [7:0] mc_wr_beat,
@@ -71,8 +73,8 @@ module flit2mc_target #(
     output logic [3:0] mc_wr_cache,
     output logic [3:0] mc_wr_qos,
     output logic mc_wr_lock,
-    output logic [15:0] mc_wr_user,
-    output logic [15:0] mc_wr_wuser,
+    output logic [aou_pkg::WIRE_USER_W-1:0] mc_wr_user,
+    output logic [aou_pkg::WIRE_USER_W-1:0] mc_wr_wuser,
     output logic [DATA_WIDTH-1:0] mc_wr_data,
     output logic [DATA_WIDTH/8-1:0] mc_wr_strb,
     // MC 写完成：每条写命令回送一次。
@@ -91,10 +93,9 @@ module flit2mc_target #(
     localparam int WCW = $clog2(MC_WR_SLOTS + 1);
 
     // 各 RP 的接收请求与待发响应消息通道。
-    logic [MSG_KIND_COUNT-1:0] tx_valid[RP_COUNT],tx_ready[RP_COUNT];
     logic [MSG_KIND_COUNT-1:0] rx_valid[RP_COUNT],rx_ready[RP_COUNT];
     logic [MSG_KIND_COUNT-1:0] reply_valid[RP_COUNT],reply_ready[RP_COUNT];
-    msg_t tx_data[RP_COUNT][MSG_KIND_COUNT],rx_data[RP_COUNT][MSG_KIND_COUNT];
+    msg_t rx_data[RP_COUNT][MSG_KIND_COUNT];
     msg_t reply_data[RP_COUNT][MSG_KIND_COUNT];
 
     // 协议错误状态、读写 beat 位置和聚合写响应状态。
@@ -106,20 +107,22 @@ module flit2mc_target #(
     logic [RD_TAG_WIDTH-1:0] rd_head,rd_tail;
     logic [RCW-1:0] rd_count;
     logic rd_occupied[MC_RD_SLOTS],rd_completed[MC_RD_SLOTS],rd_last[MC_RD_SLOTS];
-    logic [1:0] rd_plane[MC_RD_SLOTS],rd_status[MC_RD_SLOTS];
-    logic [9:0] rd_id[MC_RD_SLOTS];
-    logic [15:0] rd_user[MC_RD_SLOTS];
+    logic [RP_W-1:0] rd_plane[MC_RD_SLOTS];
+    logic [1:0] rd_status[MC_RD_SLOTS];
+    logic [WIRE_ID_W-1:0] rd_id[MC_RD_SLOTS];
+    logic [WIRE_USER_W-1:0] rd_user[MC_RD_SLOTS];
     logic [2:0] rd_size[MC_RD_SLOTS];
-    logic [6:0] rd_lane[MC_RD_SLOTS];
+    logic [LANE_W-1:0] rd_lane[MC_RD_SLOTS];
     logic [DATA_WIDTH-1:0] rd_data[MC_RD_SLOTS];
 
     // 写 ROB：只记录完成状态。
     logic [WR_TAG_WIDTH-1:0] wr_head,wr_tail;
     logic [WCW-1:0] wr_count;
     logic wr_occupied[MC_WR_SLOTS],wr_completed[MC_WR_SLOTS],wr_last[MC_WR_SLOTS];
-    logic [1:0] wr_plane[MC_WR_SLOTS],wr_status[MC_WR_SLOTS];
-    logic [9:0] wr_id[MC_WR_SLOTS];
-    logic [15:0] wr_user[MC_WR_SLOTS];
+    logic [RP_W-1:0] wr_plane[MC_WR_SLOTS];
+    logic [1:0] wr_status[MC_WR_SLOTS];
+    logic [WIRE_ID_W-1:0] wr_id[MC_WR_SLOTS];
+    logic [WIRE_USER_W-1:0] wr_user[MC_WR_SLOTS];
 
     // 读写各自的轮询位置、背压锁定与发出/退休握手。
     int unsigned rd_next,rd_held,wr_next,wr_held;
@@ -129,70 +132,39 @@ module flit2mc_target #(
     // 当前选中请求的地址、beat 与退休写响应状态。
     ax_t rd_address,wr_address;
     logic [8:0] rbeat,wbeat;
-    logic [63:0] wr_beat_addr;
+    logic [WIRE_ADDR_W-1:0] wr_beat_addr;
     logic [1:0] merged_status;
 
     // 组合逻辑：汇总本地与传输层错误。
     assign protocol_error = local_error || transport_error;
 
-    // 实例连接：传输层及响应 FIFO。
-    aou_transport #(
+    // 实例连接：传输层与响应队列。
+    aou_target_core #(
         .DATA_WIDTH(DATA_WIDTH),
         .RP_COUNT(RP_COUNT),
-        .RX_DEPTH0(WREQ_DEPTH),
-        .RX_DEPTH1(RREQ_DEPTH),
-        .RX_DEPTH2(WDATA_DEPTH),
-        .RX_DEPTH3(0),
-        .RX_DEPTH4(0)
-    ) u_transport (
+        .WREQ_DEPTH(WREQ_DEPTH),
+        .RREQ_DEPTH(RREQ_DEPTH),
+        .WDATA_DEPTH(WDATA_DEPTH),
+        .RESPONSE_DEPTH(RESPONSE_DEPTH)
+    ) u_core (
         .clk(clk),
         .rst_n(rst_n),
-        .link_up(link_up && !local_error),
-        .tx_valid(tx_valid),
-        .tx_ready(tx_ready),
-        .tx_data(tx_data),
-        .rx_valid(rx_valid),
-        .rx_ready(rx_ready),
-        .rx_data(rx_data),
+        .link_up(link_up),
+        .local_error(local_error),
+        .transport_error(transport_error),
         .flit_tx_valid(flit_tx_valid),
         .flit_tx_ready(flit_tx_ready),
         .flit_tx_data(flit_tx_data),
         .flit_rx_valid(flit_rx_valid),
         .flit_rx_ready(flit_rx_ready),
         .flit_rx_data(flit_rx_data),
-        .fault(transport_error)
+        .rx_valid(rx_valid),
+        .rx_ready(rx_ready),
+        .rx_data(rx_data),
+        .reply_valid(reply_valid),
+        .reply_ready(reply_ready),
+        .reply_data(reply_data)
     );
-    // 响应队列按消息在本端位宽下的最大位数存储。
-    for (genvar rp = 0; rp < RP_COUNT; rp++) begin : g_rp
-        for (genvar q = 0; q < MSG_KIND_COUNT; q++) begin : g_reply
-            if (q >= 3) begin : g_queue
-                localparam int W = msg_bits(q, DATA_WIDTH);
-                logic [W-1:0] m_bits;
-                logic full, empty;
-                aou_sync_fifo #(
-                    .WIDTH(W),
-                    .DEPTH(RESPONSE_DEPTH)
-                ) u_fifo (
-                    .clk(clk),
-                    .rst_n(rst_n),
-                    .wr_en(reply_valid[rp][q]),
-                    .wr_data(reply_data[rp][q][MSG_BITS-1 -: W]),
-                    .full(full),
-                    .rd_en(tx_ready[rp][q]),
-                    .rd_data(m_bits),
-                    .empty(empty),
-                    .level()
-                );
-                assign reply_ready[rp][q] = !full || (tx_ready[rp][q] && !empty);
-                assign tx_valid[rp][q] = !empty;
-                assign tx_data[rp][q] = {m_bits, {(MSG_BITS-W){1'b0}}};
-            end else begin : g_no_queue
-                assign tx_valid[rp][q] = 0;
-                assign tx_data[rp][q] = '0;
-                assign reply_ready[rp][q] = 0;
-            end
-        end
-    end
 
     // 读写仲裁各自只在成功 MC 握手后推进。被拒绝时保持选中的请求和 tag，不能重新选路。
     always_comb begin
@@ -209,11 +181,11 @@ module flit2mc_target #(
         end
         for (int n = 0; n < RP_COUNT; n++) begin
             p = (int'(rd_next)+n)%RP_COUNT;
-            if (rd_sel < 0 && rx_valid[p][1]) begin
+            if (rd_sel < 0 && rx_valid[p][K_RREQ]) begin
                 rd_sel = p;
             end
             p = (int'(wr_next)+n)%RP_COUNT;
-            if (wr_sel < 0 && rx_valid[p][0] && rx_valid[p][2]) begin
+            if (wr_sel < 0 && rx_valid[p][K_WREQ] && rx_valid[p][K_WDATA]) begin
                 wr_sel = p;
             end
         end
@@ -227,14 +199,14 @@ module flit2mc_target #(
         // 读命令
         mc_rd_valid = rd_sel >= 0 && rd_count < MC_RD_SLOTS && link_up && !protocol_error;
         if (rd_sel >= 0) begin
-            rd_address = get_req(rx_data[rd_sel][1]);
+            rd_address = get_req(rx_data[rd_sel][K_RREQ]);
             rbeat = rd_beat[rd_sel];
             if (mc_rd_valid && mc_rd_ready && rbeat == {1'b0,rd_address.len}) begin
-                rx_ready[rd_sel][1] = 1;
+                rx_ready[rd_sel][K_RREQ] = 1;
             end
         end
         mc_rd_tag = rd_tail;
-        mc_rd_rp = 2'(rd_sel >= 0 ? rd_sel : 0);
+        mc_rd_rp = RP_W'(rd_sel >= 0 ? rd_sel : 0);
         mc_rd_id = rd_address.id;
         mc_rd_addr = rd_address.addr+(64'(rbeat)<<rd_address.size);
         mc_rd_size = rd_address.size;
@@ -253,25 +225,25 @@ module flit2mc_target #(
         mc_wr_strb = '0;
         mc_wr_wuser = 0;
         if (wr_sel >= 0) begin
-            wr_address = get_req(rx_data[wr_sel][0]);
+            wr_address = get_req(rx_data[wr_sel][K_WREQ]);
             wbeat = wr_beat[wr_sel];
-            w_bad = dl_bytes(int'(rx_data[wr_sel][2][1193:1192])) < (1 << wr_address.size);
+            w_bad = dl_bytes(msg_dl(rx_data[wr_sel][K_WDATA])) < (1 << wr_address.size);
         end
         wr_beat_addr = wr_address.addr+(64'(wbeat)<<wr_address.size);
         mc_wr_valid = wr_sel >= 0 && !w_bad && wr_count < MC_WR_SLOTS && link_up && !protocol_error;
         if (wr_sel >= 0) begin
-            mc_wr_data = DATA_WIDTH'(get_data(rx_data[wr_sel][2],DATA_WIDTH));
-            mc_wr_strb = (DATA_WIDTH/8)'(get_strb(rx_data[wr_sel][2],7'(wr_beat_addr % (DATA_WIDTH/8))));
-            mc_wr_wuser = rx_data[wr_sel][2][1191:1176];
+            mc_wr_data = DATA_WIDTH'(get_data(rx_data[wr_sel][K_WDATA],DATA_WIDTH));
+            mc_wr_strb = (DATA_WIDTH/8)'(get_strb(rx_data[wr_sel][K_WDATA],LANE_W'(wr_beat_addr % (DATA_WIDTH/8))));
+            mc_wr_wuser = wdata_hdr(rx_data[wr_sel][K_WDATA]).user;
             if (mc_wr_valid && mc_wr_ready) begin
-                rx_ready[wr_sel][2] = 1;
+                rx_ready[wr_sel][K_WDATA] = 1;
                 if (wbeat == {1'b0,wr_address.len}) begin
-                    rx_ready[wr_sel][0] = 1;
+                    rx_ready[wr_sel][K_WREQ] = 1;
                 end
             end
         end
         mc_wr_tag = wr_tail;
-        mc_wr_rp = 2'(wr_sel >= 0 ? wr_sel : 0);
+        mc_wr_rp = RP_W'(wr_sel >= 0 ? wr_sel : 0);
         mc_wr_id = wr_address.id;
         mc_wr_addr = wr_beat_addr;
         mc_wr_size = wr_address.size;
@@ -304,10 +276,11 @@ module flit2mc_target #(
             end
         end
         if (rd_count != 0 && rd_occupied[rd_head] && rd_completed[rd_head] && link_up && !protocol_error) begin
-            reply_valid[rd_plane[rd_head]][3] = 1;
-            reply_data[rd_plane[rd_head]][3] = make_rdata(1024'(rd_data[rd_head]),rd_id[rd_head],rd_user[rd_head],
-                rd_status[rd_head],rd_last[rd_head],int'(rd_plane[rd_head]),rd_size[rd_head],rd_lane[rd_head]);
-            rd_retire = reply_ready[rd_plane[rd_head]][3];
+            reply_valid[rd_plane[rd_head]][K_RDATA] = 1;
+            reply_data[rd_plane[rd_head]][K_RDATA] = make_rdata(MAX_DATA_W'(rd_data[rd_head]),rd_id[rd_head],
+                rd_user[rd_head],rd_status[rd_head],rd_last[rd_head],int'(rd_plane[rd_head]),rd_size[rd_head],
+                rd_lane[rd_head]);
+            rd_retire = reply_ready[rd_plane[rd_head]][K_RDATA];
         end
         if (wr_count != 0 && wr_occupied[wr_head] && wr_completed[wr_head] && link_up && !protocol_error) begin
             merged_status = wr_status[wr_head] > write_status[wr_plane[wr_head]] ?
@@ -315,10 +288,10 @@ module flit2mc_target #(
             if (!wr_last[wr_head]) begin
                 wr_retire = 1;
             end else begin
-                reply_valid[wr_plane[wr_head]][4] = 1;
-                reply_data[wr_plane[wr_head]][4] = make_b(wr_id[wr_head],wr_user[wr_head],merged_status,
-                                                          int'(wr_plane[wr_head]));
-                wr_retire = reply_ready[wr_plane[wr_head]][4];
+                reply_valid[wr_plane[wr_head]][K_WRESP] = 1;
+                reply_data[wr_plane[wr_head]][K_WRESP] = make_b(wr_id[wr_head],wr_user[wr_head],merged_status,
+                                                                int'(wr_plane[wr_head]));
+                wr_retire = reply_ready[wr_plane[wr_head]][K_WRESP];
             end
         end
     end
@@ -369,7 +342,7 @@ module flit2mc_target #(
                 rd_id[rd_tail] <= mc_rd_id;
                 rd_user[rd_tail] <= mc_rd_user;
                 rd_size[rd_tail] <= mc_rd_size;
-                rd_lane[rd_tail] <= 7'(mc_rd_addr % (DATA_WIDTH/8));
+                rd_lane[rd_tail] <= LANE_W'(mc_rd_addr % (DATA_WIDTH/8));
                 rd_tail <= rd_tail == MC_RD_SLOTS-1 ? '0 : rd_tail+1'b1;
                 rd_next <= unsigned'((rd_sel+1)%RP_COUNT);
                 rd_beat[mc_rd_rp] <= mc_rd_last ? 0 : rd_beat[mc_rd_rp]+1'b1;
@@ -434,9 +407,6 @@ module flit2mc_target #(
     // 仿真期检查 FIFO 深度与 ROB tag 容量；综合时排除。
 `ifndef SYNTHESIS
     initial begin
-        if (WREQ_DEPTH < 1 || RREQ_DEPTH < 1 || WDATA_DEPTH < 1 || RESPONSE_DEPTH < 1) begin
-            $fatal(1, "Target FIFO depths must be positive");
-        end
         if (MC_RD_SLOTS < 1 || MC_RD_SLOTS > 256 || (1<<RD_TAG_WIDTH) < MC_RD_SLOTS ||
             MC_WR_SLOTS < 1 || MC_WR_SLOTS > 256 || (1<<WR_TAG_WIDTH) < MC_WR_SLOTS) begin
             $fatal(1, "Invalid MC tag/ROB capacity");

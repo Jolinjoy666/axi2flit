@@ -15,6 +15,8 @@ while [ $# -gt 0 ]; do
 done
 width=1024
 for v in "${make_vars[@]}"; do case $v in WIDTH=*) width=${v#WIDTH=};; esac; done
+# 深度扫描测的是链路 credit，存储侧默认用理想 MC（命令行给出 MC_IF 时以命令行为准）。
+make_vars=(MC_IF=ideal "${make_vars[@]}")
 # 每条全宽消息的 credit 粒度数（读数据 / 全选通写数据）；请求 3，写响应 1。
 case $param in
     RDATA_DEPTH) g=$([ "$width" = 256 ] && echo 8 || ([ "$width" = 512 ] && echo 14 || echo 27));;

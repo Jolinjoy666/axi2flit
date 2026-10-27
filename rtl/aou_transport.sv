@@ -37,13 +37,13 @@ module aou_transport #(
     import aou_pkg::*;
 
     // credit 计数表：可发量、已公布但尚未收到量；待归还量为组合结果。
-    logic [11:0] available [RP_COUNT][MSG_KIND_COUNT], pending [RP_COUNT][MSG_KIND_COUNT];
-    logic [11:0] promised [RP_COUNT][MSG_KIND_COUNT];
+    logic [CREDIT_CNT_W-1:0] available [RP_COUNT][MSG_KIND_COUNT], pending [RP_COUNT][MSG_KIND_COUNT];
+    logic [CREDIT_CNT_W-1:0] promised [RP_COUNT][MSG_KIND_COUNT];
     int fifo_level [RP_COUNT][MSG_KIND_COUNT];
-    logic [7:0] consumed [RP_COUNT][MSG_KIND_COUNT], granted [RP_COUNT][MSG_KIND_COUNT];
-    logic [8:0] updates [RP_COUNT][MSG_KIND_COUNT];
+    logic [GRANT_W-1:0] consumed [RP_COUNT][MSG_KIND_COUNT], granted [RP_COUNT][MSG_KIND_COUNT];
+    logic [UPDATE_W-1:0] updates [RP_COUNT][MSG_KIND_COUNT];
 
-    // credit 下一拍计算值：用整型保留越界信息，再决定是否写回 12 位计数器。
+    // credit 下一拍计算值：用整型保留越界信息，再决定是否写回计数器。
     int available_calc [RP_COUNT][MSG_KIND_COUNT];
     int promised_calc [RP_COUNT][MSG_KIND_COUNT];
     int received_calc [RP_COUNT][MSG_KIND_COUNT];
@@ -53,21 +53,32 @@ module aou_transport #(
 
     // 帧解包结果、PH credit 和协议错误状态。
     logic raw_valid, raw_ready, ph_valid, rx_fault, own_fault, bad_msg;
-    logic [15:0] ph_credit;
+    logic [PH_CREDIT_W-1:0] ph_credit;
     msg_t raw_msg;
     int raw_rp, raw_kind, raw_size;
+    // 各类消息头视图（先赋给变量再取成员，兼容不支持函数返回值成员选择的综合工具）。
+    req_hdr_t raw_req_hdr;
+    rdata_hdr_t raw_rdata_hdr;
+    wresp_hdr_t raw_wresp_hdr;
 
     // 固定五类消息的本端深度（全宽消息条数）；零深度表示该类不接收。
     localparam int DEPTHS [MSG_KIND_COUNT] = '{RX_DEPTH0, RX_DEPTH1, RX_DEPTH2, RX_DEPTH3, RX_DEPTH4};
     function automatic int depth(input int k);
         return DEPTHS[k];
     endfunction
+    // 每类的存储单元数与 credit 换算比例在 elaboration 时求出，运行期只做乘除常数。
+    localparam int UNITS [MSG_KIND_COUNT] = '{unit_count(0, DATA_WIDTH), unit_count(1, DATA_WIDTH),
+        unit_count(2, DATA_WIDTH), unit_count(3, DATA_WIDTH), unit_count(4, DATA_WIDTH)};
+    localparam int CR_GRAN [MSG_KIND_COUNT] = '{credit_gran(0, DATA_WIDTH), credit_gran(1, DATA_WIDTH),
+        credit_gran(2, DATA_WIDTH), credit_gran(3, DATA_WIDTH), credit_gran(4, DATA_WIDTH)};
+    localparam int CR_UNITS [MSG_KIND_COUNT] = '{credit_units(0, DATA_WIDTH), credit_units(1, DATA_WIDTH),
+        credit_units(2, DATA_WIDTH), credit_units(3, DATA_WIDTH), credit_units(4, DATA_WIDTH)};
     // 存储单元总数，以及空闲单元可公布的 credit 上限。
     function automatic int capacity(input int k);
-        return depth(k) * unit_count(k, DATA_WIDTH);
+        return depth(k) * UNITS[k];
     endfunction
     function automatic int grantable(input int k, input int free_units);
-        return free_units * credit_gran(k, DATA_WIDTH) / credit_units(k, DATA_WIDTH);
+        return free_units * CR_GRAN[k] / CR_UNITS[k];
     endfunction
 
     // 组合逻辑：错误汇总与子模块连接。
@@ -108,8 +119,8 @@ module aou_transport #(
         for (genvar k = 0; k < MSG_KIND_COUNT; k++) begin : g_kind
             // 先取成局部常量再用于 generate 条件，各仿真器的求值结果一致。
             localparam int D = DEPTHS[k];
-            localparam int BANKS = (k == 2 || k == 3) ? DATA_WIDTH / 256 : 1;
-            if (D > 0 && (k == 2 || k == 3)) begin : g_chunk
+            localparam int BANKS = UNITS[k];
+            if (D > 0 && is_data_kind(k)) begin : g_chunk
                 logic [$clog2(D*BANKS+1)-1:0] level;
                 aou_chunk_fifo #(
                     .BANKS(BANKS),
@@ -162,31 +173,34 @@ module aou_transport #(
     always_comb begin
         raw_rp = msg_rp(raw_msg);
         raw_kind = msg_kind(raw_msg);
-        raw_size = granules(raw_msg[1199:1192]);
+        raw_size = msg_granules(raw_msg);
+        raw_req_hdr = req_hdr(raw_msg);
+        raw_rdata_hdr = rdata_hdr(raw_msg);
+        raw_wresp_hdr = wresp_hdr(raw_msg);
         bad_msg = 0;
         raw_ready = 0;
         for (int p = 0; p < RP_COUNT; p++) begin
             fifo_valid[p] = '0;
         end
         if (raw_valid && link_up && !fault) begin
-            if (raw_kind == 5) begin
-                bad_msg = raw_msg[1199:1196] != 0 || raw_msg[1195:1193] != 4 || raw_msg[1136:1120] != 0;
+            if (raw_kind == K_MISC) begin
+                bad_msg = !legal_crdtgrant(raw_msg);
                 raw_ready = 1;
             end else begin
                 // 对端发送超出已授 credit 的消息属于协议违规，在进入存储前即判错；
                 // 未启用的类型始终没有 credit，同样被判错。
                 bad_msg = raw_rp >= RP_COUNT || raw_size > int'(promised[raw_rp][raw_kind]);
-                if (raw_kind == 0 || raw_kind == 1) begin
-                    bad_msg = bad_msg || raw_msg[1193] || !legal_req(get_req(raw_msg), DATA_WIDTH);
+                if (raw_kind == K_WREQ || raw_kind == K_RREQ) begin
+                    bad_msg = bad_msg || raw_req_hdr.rsvd || !legal_req(get_req(raw_msg), DATA_WIDTH);
                 end
-                if (raw_kind == 2 || raw_kind == 3) begin
-                    bad_msg = bad_msg || int'(raw_msg[1193:1192]) > dl_code(DATA_WIDTH);
+                if (is_data_kind(raw_kind)) begin
+                    bad_msg = bad_msg || msg_dl(raw_msg) > dl_code(DATA_WIDTH);
                 end
-                if (raw_kind == 3) begin
-                    bad_msg = bad_msg || raw_msg[1162:1160] != 0;
+                if (raw_kind == K_RDATA) begin
+                    bad_msg = bad_msg || raw_rdata_hdr.rsvd != 0;
                 end
-                if (raw_kind == 4) begin
-                    bad_msg = bad_msg || raw_msg[1193:1192] != 0 || raw_msg[1163:1160] != 0;
+                if (raw_kind == K_WRESP) begin
+                    bad_msg = bad_msg || raw_wresp_hdr.rsvd0 != 0 || raw_wresp_hdr.rsvd1 != 0;
                 end
                 if (bad_msg) begin
                     raw_ready = 1;
@@ -205,23 +219,19 @@ module aou_transport #(
                 updates[p][k] = '0;
             end
         end
-        if (ph_valid && int'(ph_credit[15:14]) < RP_COUNT) begin
+        if (ph_valid && ph_credit_rp(ph_credit) < RP_COUNT) begin
             for (int k = 0; k < MSG_KIND_COUNT; k++) begin
-                if (k < 4) begin
-                    updates[ph_credit[15:14]][k] = 9'(credit_amount(int'(ph_credit[k*3 +:3])));
-                end else begin
-                    updates[ph_credit[15:14]][k] = 9'(credit_amount(int'(ph_credit[13:12])));
-                end
+                updates[ph_credit_rp(ph_credit)][k] = UPDATE_W'(credit_amount(ph_credit_enc(ph_credit, k)));
             end
         end
         // CrdtGrant：四类三位 credit 按类型及 RP 排列，最后四组为两位写响应 credit。
-        if (raw_valid && raw_ready && !bad_msg && raw_kind == 5) begin
+        if (raw_valid && raw_ready && !bad_msg && raw_kind == K_MISC) begin
             for (int p = 0; p < RP_COUNT; p++) begin
                 for (int k = 0; k < MSG_KIND_COUNT; k++) begin
-                    if (k < 4) begin
-                        updates[p][k] = updates[p][k] + 9'(credit_amount(int'(raw_msg[1199-7-(k*4+p)*3 -:3])));
+                    if (k != K_WRESP) begin
+                        updates[p][k] = updates[p][k] + UPDATE_W'(credit_amount(cg_credit3(raw_msg, k*MAX_RP+p)));
                     end else begin
-                        updates[p][k] = updates[p][k] + 9'(credit_amount(int'(raw_msg[1199-55-p*2 -:2])));
+                        updates[p][k] = updates[p][k] + UPDATE_W'(credit_amount(cg_credit2(raw_msg, p)));
                     end
                 end
             end
@@ -232,7 +242,7 @@ module aou_transport #(
     always_comb begin
         for (int p = 0; p < RP_COUNT; p++) begin
             for (int k = 0; k < MSG_KIND_COUNT; k++) begin
-                pending[p][k] = 12'(grantable(k, capacity(k) - fifo_level[p][k]) - int'(promised[p][k]));
+                pending[p][k] = CREDIT_CNT_W'(grantable(k, capacity(k) - fifo_level[p][k]) - int'(promised[p][k]));
                 received_calc[p][k] = (raw_valid && raw_ready && !bad_msg && raw_kind == k && raw_rp == p)
                                       ? raw_size : 0;
                 available_calc[p][k] = int'(available[p][k]) + int'(updates[p][k])
@@ -258,19 +268,20 @@ module aou_transport #(
             if (raw_valid && bad_msg) begin
                 own_fault <= 1;
             end
-            if (ph_valid && ph_credit != 0 && int'(ph_credit[15:14]) >= RP_COUNT) begin
+            if (ph_valid && ph_credit != 0 && ph_credit_rp(ph_credit) >= RP_COUNT) begin
                 own_fault <= 1;
             end
             for (int p = 0; p < RP_COUNT; p++) begin
                 for (int k = 0; k < MSG_KIND_COUNT; k++) begin
-                    available[p][k] <= 12'(available_calc[p][k] > 4095 ? 4095 : available_calc[p][k]);
-                    promised[p][k] <= 12'(promised_calc[p][k]);
+                    available[p][k] <= CREDIT_CNT_W'(available_calc[p][k] > CREDIT_CNT_MAX ? CREDIT_CNT_MAX
+                                                                                         : available_calc[p][k]);
+                    promised[p][k] <= CREDIT_CNT_W'(promised_calc[p][k]);
                 end
             end
         end
     end
 
-    // 仿真期检查数据位宽、RP 数及 12 位 credit 容量，并断言 credit 账目不越界；综合时排除。
+    // 仿真期检查数据位宽、RP 数及 credit 计数容量，并断言 credit 账目不越界；综合时排除。
 `ifndef SYNTHESIS
     always_ff @(posedge clk) begin
         if (rst_n && link_up && !fault) begin
@@ -284,12 +295,13 @@ module aou_transport #(
         end
     end
     initial begin
-        if (!(DATA_WIDTH == 256 || DATA_WIDTH == 512 || DATA_WIDTH == 1024) || RP_COUNT < 1 || RP_COUNT > 4) begin
+        if (DATA_WIDTH > MAX_DATA_W || DATA_WIDTH != (MIN_DATA_W << dl_code(DATA_WIDTH)) ||
+            RP_COUNT < 1 || RP_COUNT > MAX_RP) begin
             $fatal(1, "Unsupported AoU width/RP configuration");
         end
         for (int k = 0; k < MSG_KIND_COUNT; k++) begin
-            if (depth(k) < 0 || grantable(k, capacity(k)) > 4095) begin
-                $fatal(1, "Receive capacity exceeds 12-bit credit range");
+            if (depth(k) < 0 || grantable(k, capacity(k)) > CREDIT_CNT_MAX) begin
+                $fatal(1, "Receive capacity exceeds credit counter range");
             end
         end
     end

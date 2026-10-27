@@ -1,6 +1,8 @@
 /*
  * RTL 联合验证：AXI 激励、独立字节记分板、可乱序完成的 MC 模型、AoU 字节对拍。
  * DUT 仅在时钟沿更新；参考内存依据 AXI 握手更新，MC 内存依据 MC 命令更新，二者分离。
+ * 定义 TB_MC_HIF（默认构建）时存储侧为 HIF 接口，控制器由 SV 模型 hif_mc_model 建模：不再逐拍核对 MC 命令，
+ * 改由模型检查 HIF 协议（credit、token、写指针、写数据拍数），端到端仍按参考内存核对每个 R 拍。
  * SystemC MsgBuilder 只构造期望消息，AouStreamDecoder 只解析线上字节；不参与 DUT 执行。
  * 仿真错误通过异常/非零退出码传播到 Makefile，不能把“程序运行结束”当作通过。
  */
@@ -26,6 +28,7 @@
 // 编译期配置，仅用于报告（由 Makefile 传入，与 RTL 参数一致）。
 #ifndef TEST_TX_DEPTH
 #define TEST_TX_DEPTH 0
+#define TEST_WR_ROUTE_DEPTH 0
 #define TEST_WRESP_DEPTH 0
 #define TEST_WREQ_DEPTH 0
 #define TEST_RREQ_DEPTH 0
@@ -42,6 +45,20 @@ static std::vector<PerfSummary> g_perf;
 static bool g_perf_quiet=false;
 constexpr uint64_t BASE=0x1234567800000000ULL;
 constexpr unsigned MEM_BYTES=128*1024;
+#ifdef TB_MC_HIF
+constexpr bool HIF=true;
+#else
+constexpr bool HIF=false;
+#endif
+#ifndef TEST_HIF_LINE_BYTES
+#define TEST_HIF_LINE_BYTES 64
+#define TEST_HIF_CORE_BYTES 32
+#define TEST_HIF_LPR 24
+#define TEST_HIF_HPR 8
+#define TEST_HIF_WR 32
+#endif
+// HIF 控制器模型中读出时报 ECC 错误的行（与 tb_rtl_bridge.sv 的 HIF_POISON 一致）。
+constexpr uint64_t HIF_POISON=(20480+AXI_DATA_BYTES)/TEST_HIF_LINE_BYTES*TEST_HIF_LINE_BYTES;
 using Bytes=std::array<uint8_t,BYTES>;
 
 template<class T> unsigned bit(const T& x, unsigned n) {
@@ -144,6 +161,8 @@ struct Bench {
     std::array<std::vector<Response>,2> responses;   // [0]=读完成，[1]=写完成
     uint64_t ar_time=0,w_time=0,tx_time=0,rx_time=0,target_req_time=0,target_w_time=0,target_rsp_time=0;
     unsigned max_tx=0,max_rx=0,max_target=0,max_return=0;
+    // HIF 模型的统计在复位时清零，这里按增量累计；hif_first 表示等待请求后的第一条 HIF 命令。
+    uint64_t interleave=0; std::array<uint32_t,4> hif_prev{}; bool hif_first=false;
 
     explicit Bench(bool waves=false,BridgeTestConfig settings={}) : config(settings) {
         context->traceEverOn(waves);
@@ -166,8 +185,14 @@ struct Bench {
         if(!ok) throw std::runtime_error(phase+" cycle="+std::to_string(cycle)+": "+what);
     }
     bool range(uint64_t a,unsigned size) const { return a>=BASE && a-BASE+size<=MEM_BYTES; }
-    uint8_t status(const AxChannel& a,unsigned beat) const {
-        if(!range(a.addr+(uint64_t(beat)<<a.size),1u<<a.size)) return 3;
+    uint8_t status(const AxChannel& a,unsigned beat,bool write) const {
+        const uint64_t at=a.addr+(uint64_t(beat)<<a.size); const unsigned size=1u<<a.size;
+        if(!range(at,size)) return 3;
+        if(HIF) {
+            // HIF 没有独占与逐拍写状态：独占按普通访问返回 OKAY；读到 ECC 中毒行的拍为 SLVERR。
+            const uint64_t p=BASE+HIF_POISON;
+            return (!write && at<p+TEST_HIF_LINE_BYTES && at+size>p) ? 2 : 0;
+        }
         if(a.user==0xe002 && beat==1) return 2; // 定向故障：中间拍失败、末拍成功，验证 B 不丢错误。
         return a.lock ? 2 : 0;
     }
@@ -200,7 +225,7 @@ struct Bench {
             const unsigned rp=c.a.qos%TEST_RP, size=1u<<c.a.size;
             const uint64_t address=c.a.addr+uint64_t(c.beat)*size;
             const unsigned lane=unsigned(address%BYTES);
-            auto s=status(c.a,c.beat);
+            auto s=status(c.a,c.beat,true);
             for(unsigned j=0;j<BYTES;j++) {
                 w.strb[j]=cmd.strb[j]=uint8_t(bit(dut->s_axi_wstrb,j));
                 if(w.strb[j]&&(j<lane||j>=lane+size)) s=2;
@@ -209,7 +234,8 @@ struct Bench {
             if(!s) for(unsigned j=0;j<size;j++) if(w.strb[lane+j]) reference[address-BASE+j]=d[lane+j];
             require(w.last==(c.beat==c.a.len),"host WLAST construction");
             expected(0,ref_wdata(d,cmd.strb,w.user,rp,c.a.size,lane));
-            expect_cmd[rp][1].push_back(cmd); ++c.beat; ++w_count;
+            if(!HIF) expect_cmd[rp][1].push_back(cmd);
+            ++c.beat; ++w_count;
             if(w.last) {
                 w_time=cycle; BChannel b; b.id=c.a.id; b.user=c.a.user; b.resp=c.status;
                 expect_b[b.id].push_back(b); expected(1,MsgBuilder::build_write_resp(b,rp));
@@ -220,8 +246,8 @@ struct Bench {
             const auto a=fields(false); const unsigned rp=a.qos%TEST_RP;
             ++ar_count; ar_time=cycle; expected(0,MsgBuilder::build_read_req(a,rp));
             for(unsigned n=0;n<=a.len;n++) {
-                Cmd cmd; cmd.a=a; cmd.beat=n; expect_cmd[rp][0].push_back(cmd);
-                RChannel r; r.id=a.id; r.user=a.user; r.last=n==a.len; r.resp=status(a,n);
+                Cmd cmd; cmd.a=a; cmd.beat=n; if(!HIF) expect_cmd[rp][0].push_back(cmd);
+                RChannel r; r.id=a.id; r.user=a.user; r.last=n==a.len; r.resp=status(a,n,false);
                 uint64_t address=a.addr+(uint64_t(n)<<a.size); unsigned lane=unsigned(address%BYTES);
                 if(!r.resp) for(unsigned j=0;j<(1u<<a.size);j++) r.data[lane+j]=reference[address-BASE+j];
                 expected(1,ref_rdata(r,rp,a.size,lane));
@@ -263,7 +289,7 @@ struct Bench {
         }
         auto& list=responses[write];
         for(const auto& r:list) require(r.tag!=f.tag,"MC tag reused while outstanding");
-        Response r; r.tag=f.tag; r.status=status(a,e.beat); r.sequence=mc_count++; ++(write ? mc_wr : mc_rd);
+        Response r; r.tag=f.tag; r.status=status(a,e.beat,write); r.sequence=mc_count++; ++(write ? mc_wr : mc_rd);
         r.due=cycle+(stress ? config.mc_latency+(mc_count*7)%23 : config.mc_latency);
         next_mc_issue[write]=cycle+config.mc_interval;
         for(unsigned j=0;j<BYTES;j++) if(write&&e.strb[j]&&(j<lane||j>=lane+size)) r.status=2;
@@ -273,6 +299,20 @@ struct Bench {
         }
         list.push_back(r);
         if(measure) max_target=std::max(max_target,unsigned((cycle-(write ? std::max(target_req_time,target_w_time) : target_req_time))*2));
+    }
+    // HIF：模型统计按增量累计；延迟按“请求帧到达→第一条 HIF 命令”“末拍数据→响应上线”测量。
+    void hif_event() {
+        require(!dut->mc_model_error,"HIF controller model reported a protocol violation");
+        const std::array<uint32_t,4> now{dut->mc_stat_rd,dut->mc_stat_wr,dut->mc_stat_ooo,dut->mc_stat_interleave};
+        std::array<uint64_t*,4> total{&mc_rd,&mc_wr,&ooo,&interleave};
+        for(unsigned i=0;i<4;i++) { if(now[i]<hif_prev[i]) hif_prev[i]=0; *total[i]+=now[i]-hif_prev[i]; hif_prev[i]=now[i]; }
+        if(measure) {
+            if((dut->hif_obs&1)&&hif_first) {
+                max_target=std::max(max_target,unsigned((cycle-std::max(target_req_time,target_w_time))*2));
+                hif_first=false;
+            }
+            if(dut->hif_obs&6) target_rsp_time=cycle;
+        }
     }
     struct McFields {
         unsigned tag=0,rp=0,id=0,size=0,len=0,beat=0,prot=0,cache=0,qos=0,user=0,wuser=0;
@@ -333,7 +373,7 @@ struct Bench {
         } else if(measure) {
             for(const auto& m:parsed.messages) {
                 if(index==2&&(m.type==MsgType::ReadData||m.type==MsgType::WriteResp)) rx_time=cycle;
-                if(index==3&&(m.type==MsgType::ReadReq||m.type==MsgType::WriteReq)) target_req_time=cycle;
+                if(index==3&&(m.type==MsgType::ReadReq||m.type==MsgType::WriteReq)) { target_req_time=cycle; hif_first=true; }
                 if(index==3&&(m.type==MsgType::WriteData||m.type==MsgType::WriteDataFull)) target_w_time=cycle;
             }
         }
@@ -346,8 +386,11 @@ struct Bench {
         dut->reverse_enable=!block_link&&(!pace||rbudget>=256)&&(!stress||cycle%5!=0);
         dut->s_axi_rready=!block_axi&&(!stress||cycle%11>=4);
         dut->s_axi_bready=!block_axi&&(!stress||cycle%13>=3);
-        dut->mc_rd_ready=!block_mc&&cycle>=next_mc_issue[0]&&(!stress||cycle%9>=3);
-        dut->mc_wr_ready=!block_mc&&cycle>=next_mc_issue[1]&&(!stress||cycle%7>=2);
+        if(HIF) { dut->mc_block=block_mc; dut->mc_stress=stress; }
+        else {
+            dut->mc_rd_ready=!block_mc&&cycle>=next_mc_issue[0]&&(!stress||cycle%9>=3);
+            dut->mc_wr_ready=!block_mc&&cycle>=next_mc_issue[1]&&(!stress||cycle%7>=2);
+        }
         dut->forward_deliver=1; dut->reverse_deliver=1;
         if(config.physical()) {
             // 串行发送间隔与传播流水线分别建模；延迟不会重复降低稳态带宽。
@@ -362,7 +405,7 @@ struct Bench {
                 response[port]=int(i); if(!stress) break;
             }
         // 固定响应就绪接口没有反压时直接选择；异常测试可自己驱动完成口。
-        if(checking) {
+        if(checking&&!HIF) {
             dut->mc_rd_rsp_valid=response[0]>=0;
             if(response[0]>=0) { const auto& r=responses[0][response[0]]; dut->mc_rd_rsp_tag=r.tag; dut->mc_rd_rsp_resp=r.status; pack(dut->mc_rd_rsp_data,r.data); }
             dut->mc_wr_rsp_valid=response[1]>=0;
@@ -393,7 +436,7 @@ struct Bench {
                     }
                 }
             }
-            for(unsigned port=0;port<2;port++) {
+            for(unsigned port=0;port<2&&!HIF;port++) {
                 const bool fire=port ? dut->mc_wr_rsp_valid&&dut->mc_wr_rsp_ready : dut->mc_rd_rsp_valid&&dut->mc_rd_rsp_ready;
                 if(response[port]<0||!fire) continue;
                 if(measure) target_rsp_time=cycle;
@@ -401,9 +444,9 @@ struct Bench {
                 for(unsigned i=0;i<list.size();i++) if(list[i].sequence<list[response[port]].sequence) { ++ooo; break; }
                 list.erase(list.begin()+response[port]);
             }
-            mc_event();
+            if(HIF) hif_event(); else mc_event();
             if((dut->fwd_valid&&!dut->fwd_ready)||(dut->s_axi_rvalid&&!dut->s_axi_rready)||
-               (dut->mc_rd_valid&&!dut->mc_rd_ready)||(dut->mc_wr_valid&&!dut->mc_wr_ready)) ++stall_cycles;
+               ((dut->perf_stall>>11)&1)) ++stall_cycles;
         }
         context->timeInc(1000); if(trace) trace->dump(context->time());
         dut->clk=1; dut->eval(); context->timeInc(1000); if(trace) trace->dump(context->time());
@@ -419,9 +462,7 @@ struct Bench {
         a.burst=1; a.qos=uint8_t(qos); a.user=uint16_t(0x8100+id); a.prot=3; a.cache=10; a.lock=lock; return a;
     }
     void aw(const AxChannel& a) {
-        dut->s_axi_awaddr=a.addr; dut->s_axi_awid=a.id; dut->s_axi_awlen=a.len; dut->s_axi_awsize=a.size;
-        dut->s_axi_awburst=a.burst; dut->s_axi_awqos=a.qos; dut->s_axi_awcache=a.cache; dut->s_axi_awprot=a.prot;
-        dut->s_axi_awlock=a.lock; dut->s_axi_awuser=a.user; dut->s_axi_awvalid=1;
+        drive_aw(a); dut->s_axi_awvalid=1;
         until([&]{return aw_fire;}); dut->s_axi_awvalid=0;
     }
     void ar(const AxChannel& a) {
@@ -430,19 +471,39 @@ struct Bench {
         dut->s_axi_arlock=a.lock; dut->s_axi_aruser=a.user; dut->s_axi_arvalid=1;
         until([&]{return ar_fire;}); dut->s_axi_arvalid=0;
     }
+    void drive_aw(const AxChannel& a) {
+        dut->s_axi_awaddr=a.addr; dut->s_axi_awid=a.id; dut->s_axi_awlen=a.len; dut->s_axi_awsize=a.size;
+        dut->s_axi_awburst=a.burst; dut->s_axi_awqos=a.qos; dut->s_axi_awcache=a.cache; dut->s_axi_awprot=a.prot;
+        dut->s_axi_awlock=a.lock; dut->s_axi_awuser=a.user;
+    }
+    void drive_w(const AxChannel& a,unsigned n,unsigned seed,int mask) {
+        Bytes d{}; dut->s_axi_wstrb={}; const unsigned lane=unsigned((a.addr+(uint64_t(n)<<a.size))%BYTES);
+        for(unsigned j=0;j<BYTES;j++) {
+            d[j]=uint8_t(seed*17+n*29+j*7+(j>>3));
+            bool strobe=j>=lane&&j<lane+(1u<<a.size);
+            if(mask==1) strobe=strobe&&(j%3!=0); if(mask==2) strobe=false;
+            set_bit(dut->s_axi_wstrb,j,strobe);
+        }
+        pack(dut->s_axi_wdata,d); dut->s_axi_wuser=uint16_t(0x5100+n); dut->s_axi_wlast=n==a.len;
+    }
     void w(const AxChannel& a,unsigned seed=1,int mask=0) {
         for(unsigned n=0;n<=a.len;n++) {
-            Bytes d{}; dut->s_axi_wstrb={}; const unsigned lane=unsigned((a.addr+(uint64_t(n)<<a.size))%BYTES);
-            for(unsigned j=0;j<BYTES;j++) {
-                d[j]=uint8_t(seed*17+n*29+j*7+(j>>3));
-                bool strobe=j>=lane&&j<lane+(1u<<a.size);
-                if(mask==1) strobe=strobe&&(j%3!=0); if(mask==2) strobe=false;
-                set_bit(dut->s_axi_wstrb,j,strobe);
-            }
-            pack(dut->s_axi_wdata,d); dut->s_axi_wuser=uint16_t(0x5100+n);
-            dut->s_axi_wlast=n==a.len; dut->s_axi_wvalid=1;
+            drive_w(a,n,seed,mask); dut->s_axi_wvalid=1;
             until([&]{return w_fire;}); dut->s_axi_wvalid=0;
         }
+    }
+    // 多笔写突发：AW 与 W 两个通道各自推进，第 i 笔数据种子为 i+1。
+    // AXI 规定主机不得等 AWREADY 才给出 WVALID；从机何时接受 AW、W 由 RTL 决定（本桥要等对应 AW 进入写路由 FIFO）。
+    void aw_w(const std::vector<AxChannel>& bursts) {
+        size_t ai=0,wi=0; unsigned beat=0; const auto end=cycle+200000;
+        while(ai<bursts.size()||wi<bursts.size()) {
+            dut->s_axi_awvalid=ai<bursts.size(); if(ai<bursts.size()) drive_aw(bursts[ai]);
+            dut->s_axi_wvalid=wi<bursts.size(); if(wi<bursts.size()) drive_w(bursts[wi],beat,unsigned(wi+1),0);
+            tick(); require(cycle<end,"transaction timeout");
+            if(aw_fire) ++ai;
+            if(w_fire) { if(beat==bursts[wi].len) { ++wi; beat=0; } else ++beat; }
+        }
+        dut->s_axi_awvalid=0; dut->s_axi_wvalid=0;
     }
     void write(const AxChannel& a,unsigned seed=1,int mask=0) { auto b=b_count; aw(a); w(a,seed,mask); until([&]{return b_count==b+1;}); }
     void read(const AxChannel& a) { auto n=read_done; ar(a); until([&]{return read_done==n+1;}); }
@@ -452,14 +513,14 @@ struct Bench {
         require(responses[0].empty()&&responses[1].empty()&&write_context.empty(),"pending MC/AXI state after drain");
         for(auto& dir:expect_msg) for(auto& rp:dir) for(auto& q:rp) require(q.empty(),"missing wire message after drain");
         for(auto& rp:expect_cmd) for(auto& q:rp) require(q.empty(),"missing MC command after drain");
-        require(reference==memory,"final independent memory images differ");
+        if(!HIF) require(reference==memory,"final independent memory images differ");
     }
     // 联合复位明确取消所有在途事务；两端、链路 FIFO、MC 模型和记分板同时清空。
     // 不把“单端复位后旧 MC 响应继续到达”误当成受支持的恢复协议。
     void coordinated_reset() {
         checking=false; dut->link_up=0; dut->rst_n=0;
         dut->s_axi_awvalid=0; dut->s_axi_arvalid=0; dut->s_axi_wvalid=0;
-        dut->mc_rd_rsp_valid=0; dut->mc_wr_rsp_valid=0;
+        dut->mc_rd_rsp_valid=0; dut->mc_wr_rsp_valid=0; dut->mc_block=0; dut->mc_stress=0;
         for(int i=0;i<4;i++) tick();
         write_context.clear(); responses={}; expect_r.clear(); expect_b.clear();
         for(auto& rp:expect_cmd) for(auto& q:rp) q.clear();
@@ -499,11 +560,16 @@ static void report_functional(const Bench& b,const PhaseLog& log,double wall_s,u
         return t+std::string(std::max(0,width-cols),' ');
     };
     auto u=[](uint64_t v) { return (unsigned long long)v; };
-    std::printf("\n============ 独立 RTL 仿真  DATA_WIDTH=%u  RP=%u ============\n",AXI_DATA_WIDTH,TEST_RP);
-    std::printf("配置  深度 TX %d，RDATA/WRESP %d/%d，WREQ/RREQ/WDATA %d/%d/%d，RESPONSE %d；MC_SLOTS %d/%d；链路限速 %.0f GB/s（%s）\n",
-                TEST_TX_DEPTH,TEST_RX_DEPTH,TEST_WRESP_DEPTH,TEST_WREQ_DEPTH,TEST_RREQ_DEPTH,TEST_WDATA_DEPTH,
-                TEST_RESPONSE_DEPTH,TEST_MC_RD_SLOTS,TEST_MC_WR_SLOTS,LINK_BYTES_PER_NS,LINK_BITS_PER_SYMBOL==2 ? "PAM4" : "NRZ");
-    std::printf("%s%s%s%s\n",pad("阶段",28).c_str(),pad("周期",8).c_str(),pad("写 笔/拍",12).c_str(),"读 笔/拍");
+    std::printf("\n============ 独立 RTL 仿真  DATA_WIDTH=%u  RP=%u%s ============\n",AXI_DATA_WIDTH,TEST_RP,
+                HIF ? "  存储侧 HIF" : "");
+    std::printf("配置  深度 TX %d、写路由 %d，RDATA/WRESP %d/%d，WREQ/RREQ/WDATA %d/%d/%d，RESPONSE %d；",
+                TEST_TX_DEPTH,TEST_WR_ROUTE_DEPTH,TEST_RX_DEPTH,TEST_WRESP_DEPTH,TEST_WREQ_DEPTH,TEST_RREQ_DEPTH,TEST_WDATA_DEPTH,
+                TEST_RESPONSE_DEPTH);
+    if(HIF) std::printf("HIF %d 位、每条命令 %dB，credit LPR/HPR/WR %d/%d/%d；",TEST_HIF_CORE_BYTES*8,TEST_HIF_LINE_BYTES,
+                        TEST_HIF_LPR,TEST_HIF_HPR,TEST_HIF_WR);
+    else std::printf("MC_SLOTS %d/%d；",TEST_MC_RD_SLOTS,TEST_MC_WR_SLOTS);
+    std::printf("链路限速 %.0f GB/s（%s）\n",LINK_BYTES_PER_NS,LINK_BITS_PER_SYMBOL==2 ? "PAM4" : "NRZ");
+    std::printf("%s%s%s%s\n",pad("阶段",28).c_str(),pad("周期",8).c_str(),pad("写 突发/拍",12).c_str(),"读 突发/拍");
     for(const auto& x:log.rows) {
         char wbuf[32],rbuf[32],cbuf[32];
         std::snprintf(cbuf,sizeof cbuf,"%llu",u(x.cycles));
@@ -519,10 +585,12 @@ static void report_functional(const Bench& b,const PhaseLog& log,double wall_s,u
         if(p.dir=="write") std::printf("%s写 %.2f GB/s（上限 %.2f）\n",head,p.gbps,p.upper);
         if(p.dir=="mixed") std::printf("%s同时读写 %.2f / %.2f GB/s\n",head,p.gbps,p.wgbps);
     }
-    std::printf("统计  写 %llu/%llu、读 %llu/%llu（笔/拍），MC 命令 读 %llu 写 %llu，MC 乱序 %llu，链路消息核对 %llu 条（跨帧 %llu），数据错误 0\n",
+    if(HIF) std::printf("统计  写 %llu 突发 %llu 拍、读 %llu 突发 %llu 拍，HIF 命令 读 %llu 写 %llu，乱序返回 %llu、交织 %llu，链路消息核对 %llu 条（跨帧 %llu），数据错误 0\n",
+                u(aw),u(w),u(ar),u(r),u(mc_rd),u(mc_wr),u(b.ooo),u(b.interleave),u(b.message_count),u(b.spanning));
+    else std::printf("统计  写 %llu 突发 %llu 拍、读 %llu 突发 %llu 拍，MC 命令 读 %llu 写 %llu，MC 乱序 %llu，链路消息核对 %llu 条（跨帧 %llu），数据错误 0\n",
                 u(aw),u(w),u(ar),u(r),u(mc_rd),u(mc_wr),u(b.ooo),u(b.message_count),u(b.spanning));
     uint64_t perf_cycles=0; for(const auto& p:g_perf) perf_cycles+=p.cycles;
-    std::printf("用时  仿真 %.1f us，运行 %.1f s\n",(total_cycles+perf_cycles)*2/1000.0,wall_s);
+    std::printf("用时  硬件时间 %.1f us（被仿真电路经过的时间），本机运行 %.1f s\n",(total_cycles+perf_cycles)*2/1000.0,wall_s);
 }
 
 void performance(const BridgeTestConfig& cfg);
@@ -550,10 +618,11 @@ void functional(bool waves,bool with_perf) {
     auto lock=b.addr(20480,2,SIZE,41,0,true); b.write(lock); b.read(lock);
     auto middle_error=b.addr(20480,4,SIZE,42); middle_error.user=0xe002;
     b.write(middle_error,19); b.read(middle_error);
+    if(HIF) { auto far=b.addr(4*MEM_BYTES,2,SIZE,43); b.write(far); b.read(far); }   // 桥的地址窗口外
     log.begin(TEST_RP>1 ? "多事务并发、多RP、MC乱序" : "多事务并发、MC乱序","outstanding, multi-RP, MC reordering"); b.stress=true;
     std::vector<AxChannel> batch;
-    for(unsigned i=0;i<4;i++) { batch.push_back(b.addr(24576+i*4096,16,SIZE,50+i,i)); b.aw(batch.back()); }
-    for(unsigned i=0;i<batch.size();i++) b.w(batch[i],i+1);
+    for(unsigned i=0;i<4;i++) batch.push_back(b.addr(24576+i*4096,16,SIZE,50+i,i));
+    b.aw_w(batch);
     b.until([&]{return b.b_count==b.aw_count;});
     for(const auto& a:batch) b.ar(a);
     b.until([&]{return b.read_done==b.ar_count;});
@@ -655,14 +724,15 @@ void performance(const BridgeTestConfig& cfg) {
             }
         };
         load(cfg.warmup);
-        const auto start=b.cycle, completions=wr ? b.b_count : b.r_count;
+        // 读按 R 握手、写按 W 握手逐拍计字节；按 B 计会使统计窗边界误差达到整笔突发。
+        const auto start=b.cycle, completions=wr ? b.w_count : b.r_count;
         const auto first_frame=wr ? b.fwd_frames : b.rev_frames;
         const unsigned dir=wr ? 0 : 1;
         const auto used_start=b.used_granules[dir],empty_start=b.empty_frames[dir];
         const auto stall_start=b.stalls; b.rob_peak=0;
         load(cfg.cycles);
         const auto duration=(b.cycle-start)*2;
-        const auto bytes=((wr ? b.b_count : b.r_count)-completions)*BB*(wr ? cfg.burst : 1);
+        const auto bytes=((wr ? b.w_count : b.r_count)-completions)*BB;
         const auto frames=(wr ? b.fwd_frames : b.rev_frames)-first_frame;
         const auto used=b.used_granules[dir]-used_start,empty=b.empty_frames[dir]-empty_start;
         const auto stalls=b.stalls; const auto peak=b.rob_peak;
@@ -673,9 +743,10 @@ void performance(const BridgeTestConfig& cfg) {
         const double wire_eff=double(cfg.burst*BB)/(g*5*cfg.burst+(wr ? 15 : 0))*240/256;
         const double codec_cap=BB/2.0*(wr ? double(cfg.burst)/(cfg.burst+1) : 1);
         double upper=std::min(codec_cap,BB/(2.0*cfg.mc_interval));
+        if(HIF) upper=std::min(upper,TEST_HIF_CORE_BYTES/2.0);   // HIF 数据口每拍 CORE_DATA_WIDTH
         if(cfg.paced()) upper=std::min(upper,cfg.wire_gbps()*wire_eff);
-        // 完成窗口存在在途边界误差；上限检查容许两笔事务的差额，不改动实测值。
-        b.require(bandwidth<=upper+2.0*cfg.burst*BB/duration,"throughput exceeds configured upper bound");
+        // 统计窗边界误差不超过一拍；上限检查容许两拍的差额。
+        b.require(bandwidth<=upper+2.0*BB/duration,"throughput exceeds configured upper bound");
         const double rate=upper/BB*2;
         const unsigned required_depth=unsigned(std::ceil(rate*cfg.credit_rtt_cycles))+2;
         const unsigned configured_depth=wr ? TEST_WDATA_DEPTH : TEST_RX_DEPTH;
@@ -723,7 +794,8 @@ void performance_mixed(const BridgeTestConfig& cfg) {
     Bench b(false,cfg); b.phase="mixed read/write throughput";
     b.pace=cfg.paced(); b.stress=cfg.scenario=="backpressure";
     unsigned rseq=0,wseq=0;
-    auto pump=[&](bool accept_new) {
+    // ar_new < 0 时 AR 与 AW 一样由 accept_new 决定；收尾时分别控制，只保持尚未握手的那一个。
+    auto pump=[&](bool accept_new,int ar_new=-1) {
         const auto w=b.addr(4096,cfg.burst,AXI_SIZE_CODE,wseq%32);
         b.dut->s_axi_awvalid=accept_new && b.write_context.size()<8;
         b.dut->s_axi_awaddr=w.addr; b.dut->s_axi_awid=w.id; b.dut->s_axi_awlen=w.len;
@@ -738,7 +810,7 @@ void performance_mixed(const BridgeTestConfig& cfg) {
             b.dut->s_axi_wuser=uint16_t(0x5100+c.beat);
         }
         const auto r=b.addr(0,cfg.burst,AXI_SIZE_CODE,32+rseq%32);
-        b.dut->s_axi_arvalid=accept_new;
+        b.dut->s_axi_arvalid=ar_new<0 ? accept_new : ar_new!=0;
         b.dut->s_axi_araddr=r.addr; b.dut->s_axi_arid=r.id; b.dut->s_axi_arlen=r.len;
         b.dut->s_axi_arsize=r.size; b.dut->s_axi_arburst=1; b.dut->s_axi_arqos=0;
         b.dut->s_axi_arcache=r.cache; b.dut->s_axi_arprot=r.prot;
@@ -746,17 +818,18 @@ void performance_mixed(const BridgeTestConfig& cfg) {
         b.tick(); if(b.aw_fire) ++wseq; if(b.ar_fire) ++rseq;
     };
     for(unsigned n=0;n<cfg.warmup;n++) pump(true);
-    const auto start=b.cycle,r0=b.r_count,b0=b.b_count,f0=b.fwd_frames,v0=b.rev_frames;
+    const auto start=b.cycle,r0=b.r_count,w0=b.w_count,f0=b.fwd_frames,v0=b.rev_frames;
     const auto u0=b.used_granules; const auto stall_start=b.stalls; b.rob_peak=0;
     for(unsigned n=0;n<cfg.cycles;n++) pump(true);
     const auto duration=(b.cycle-start)*2;
-    const double rd=double((b.r_count-r0)*BYTES)/duration, wr=double((b.b_count-b0)*BYTES*cfg.burst)/duration;
+    const double rd=double((b.r_count-r0)*BYTES)/duration, wr=double((b.w_count-w0)*BYTES)/duration;
     const auto ff=b.fwd_frames-f0,rf=b.rev_frames-v0;
     const double ffill=double(b.used_granules[0]-u0[0])/(ff*48)*100, rfill=double(b.used_granules[1]-u0[1])/(rf*48)*100;
     const auto stalls=b.stalls; const auto peak=b.rob_peak;
     b.require(ff>0&&rf>0&&rd>0&&wr>0,"invalid mixed throughput accounting");
     // 收尾：已拉高的地址保持到握手，发完已接受 AW 的 W，再排空并核对内存。
-    while((b.dut->s_axi_awvalid&&!b.aw_fire)||(b.dut->s_axi_arvalid&&!b.ar_fire)) pump(true);
+    bool aw_wait=b.dut->s_axi_awvalid&&!b.aw_fire, ar_wait=b.dut->s_axi_arvalid&&!b.ar_fire;
+    while(aw_wait||ar_wait) { pump(aw_wait,int(ar_wait)); if(b.aw_fire) aw_wait=false; if(b.ar_fire) ar_wait=false; }
     b.dut->s_axi_awvalid=0; b.dut->s_axi_arvalid=0;
     while(!b.write_context.empty()) pump(false);
     b.dut->s_axi_wvalid=0; b.dut->s_axi_arvalid=0;
@@ -797,7 +870,9 @@ void negative() {
                 b.dut->s_axi_arvalid=1; b.dut->s_axi_arburst=1;
                 b.dut->s_axi_araddr=BASE+1; b.dut->s_axi_arsize=AXI_SIZE_CODE;
                 if(name=="size") { b.dut->s_axi_araddr=BASE; b.dut->s_axi_arsize=7; }
-            } else if(name=="bad_mc_tag") { b.dut->mc_rd_rsp_valid=1; b.dut->mc_rd_rsp_tag=0; }
+            } else if(name=="bad_mc_tag") {
+                if(HIF) b.dut->mc_inject_bad_token=1; else { b.dut->mc_rd_rsp_valid=1; b.dut->mc_rd_rsp_tag=0; }
+            }
             else {
                 AouFlit f; f.clear(); f.valid=true;
                 if(name=="bad_length") { f.msg_start=1; f.payload[0]=0x33; }

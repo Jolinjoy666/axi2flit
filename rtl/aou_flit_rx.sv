@@ -18,7 +18,7 @@ module aou_flit_rx #(
     output aou_pkg::msg_t msg_data,
     // PH credit 与解析错误。
     output logic header_valid,
-    output logic [15:0] header_credit,
+    output logic [aou_pkg::PH_CREDIT_W-1:0] header_credit,
     output logic fault
 );
     import aou_pkg::*;
@@ -34,7 +34,7 @@ module aou_flit_rx #(
 
     // 队首解析位置与输出寄存器的下一拍值；跨帧消息等下一帧到齐后一次拼接。
     logic valid_n, fault_n;
-    logic [5:0] cursor, cursor_n;
+    logic [GRANULE_IDX_W-1:0] cursor, cursor_n;
     msg_t output_n, work;
 
     // 消息边界、长度和跨帧复制时使用的组合临时量。
@@ -45,7 +45,7 @@ module aou_flit_rx #(
     // PH credit 仅在外部接收握手时处理一次，FIFO 出队不重复授信。
     assign flit_ready = rst_n && enable && !fault && (frame_count < FRAME_DEPTH || frame_pop);
     assign header_valid = flit_valid && flit_ready && legal_ph(flit_data);
-    assign header_credit = {flit_data[1959 -:8], flit_data[1967 -:8]};
+    assign header_credit = get_ph_credit(flit_data);
 
     assign following_ptr = read_ptr == FRAME_DEPTH-1 ? '0 : read_ptr+1'b1;
     assign frame = frames[read_ptr];
@@ -82,7 +82,7 @@ module aou_flit_rx #(
                     frame_pop = 1;
                     cursor_n = 0;
                 end else begin
-                    len = granules(frame[1919-pos*40 -:8]);
+                    len = granules(frame[PAYLOAD_TOP-pos*GRANULE_BITS -: 8]);
                     end_pos = pos+len;
                     bad = len == 0;
                     for (int g = 0; g < MSG_MAX_GRANULES; g++) begin
@@ -91,13 +91,15 @@ module aou_flit_rx #(
                                 if (g > 0 && starts[pos+g]) begin
                                     bad = 1;
                                 end
-                                work[1199-g*40 -:40] = frame[1919-(pos+g)*40 -:40];
+                                work[MSG_TOP-g*GRANULE_BITS -: GRANULE_BITS] =
+                                    frame[PAYLOAD_TOP-(pos+g)*GRANULE_BITS -: GRANULE_BITS];
                             end else if (frame_count >= 2) begin
                                 // 下一帧被本消息占用的粒度不能再标记为新消息起点。
                                 if (following_starts[pos+g-FLIT_GRANULES]) begin
                                     bad = 1;
                                 end
-                                work[1199-g*40 -:40] = following_frame[1919-(pos+g-FLIT_GRANULES)*40 -:40];
+                                work[MSG_TOP-g*GRANULE_BITS -: GRANULE_BITS] =
+                                    following_frame[PAYLOAD_TOP-(pos+g-FLIT_GRANULES)*GRANULE_BITS -: GRANULE_BITS];
                             end
                         end
                     end
@@ -106,10 +108,10 @@ module aou_flit_rx #(
                     end else if (end_pos <= FLIT_GRANULES || frame_count >= 2) begin
                         output_n = work;
                         valid_n = 1;
-                        cursor_n = 6'(end_pos);
+                        cursor_n = GRANULE_IDX_W'(end_pos);
                         if (end_pos >= FLIT_GRANULES) begin
                             frame_pop = 1;
-                            cursor_n = 6'(end_pos-FLIT_GRANULES);
+                            cursor_n = GRANULE_IDX_W'(end_pos-FLIT_GRANULES);
                         end
                     end
                 end

@@ -1,4 +1,4 @@
-// 数据消息接收缓冲：按 8 粒度（320 位）一块分块存放，BANKS 个 bank 交错，第 s 块位于
+// 数据消息接收缓冲：按 CHUNK_GRANULES（8 粒度，320 位）一块分块存放，BANKS 个 bank 交错，第 s 块位于
 // bank s%BANKS 的第 s/BANKS 行。一条消息占 chunk_count(粒度数) 个连续块（最多 BANKS 块），
 // 每拍可写入一条、读出一条：每个 bank 每拍只读写一行，再按起始 bank 旋转拼成消息。
 // 满且同拍出队时，按出队后释放的块数判断能否入队。level 以块计。
@@ -22,12 +22,12 @@ module aou_chunk_fifo #(
     output logic [CW-1:0] level
 );
     import aou_pkg::*;
-    localparam int SLOT_BITS = 8 * GRANULE_BITS;
+    localparam int EXT_BITS = MAX_MSG_CHUNKS * CHUNK_BITS;
 
-    logic [SLOT_BITS-1:0] mem [BANKS][ROWS];
+    logic [CHUNK_BITS-1:0] mem [BANKS][ROWS];
     logic [PW-1:0] rd, wr;
-    logic [4*SLOT_BITS-1:0] s_ext, m_ext;
-    logic [SLOT_BITS-1:0] bank_out [BANKS];
+    logic [EXT_BITS-1:0] s_ext, m_ext;
+    logic [CHUNK_BITS-1:0] bank_out [BANKS];
     int s_need, m_need;
     logic push, pop;
 
@@ -52,16 +52,16 @@ module aou_chunk_fifo #(
             bank_out[b] = mem[b][row_of(slot_of(int'(rd), i))];
         end
         m_ext = '0;
-        for (int i = 0; i < 4; i++) begin
+        for (int i = 0; i < MAX_MSG_CHUNKS; i++) begin
             if (i < BANKS) begin
-                m_ext[4*SLOT_BITS-1-i*SLOT_BITS -: SLOT_BITS] = bank_out[(bank_of(int'(rd)) + i) % BANKS];
+                m_ext[EXT_BITS-1-i*CHUNK_BITS -: CHUNK_BITS] = bank_out[(bank_of(int'(rd)) + i) % BANKS];
             end
         end
     end
-    assign m_data = m_ext[4*SLOT_BITS-1 -: MSG_BITS];
-    assign s_ext = {s_data, {(4*SLOT_BITS-MSG_BITS){1'b0}}};
-    assign s_need = chunk_count(granules(s_data[1199:1192]));
-    assign m_need = chunk_count(granules(m_data[1199:1192]));
+    assign m_data = m_ext[EXT_BITS-1 -: MSG_BITS];
+    assign s_ext = {s_data, {(EXT_BITS-MSG_BITS){1'b0}}};
+    assign s_need = chunk_count(msg_granules(s_data));
+    assign m_need = chunk_count(msg_granules(m_data));
     assign m_valid = rst_n && level != 0;
     assign pop = m_valid && m_ready;
     assign s_ready = rst_n && (int'(level) - (pop ? m_need : 0) + s_need <= N);
@@ -74,7 +74,7 @@ module aou_chunk_fifo #(
                 int i;
                 i = (b - bank_of(int'(wr)) + BANKS) % BANKS;
                 if (i < s_need) begin
-                    mem[b][row_of(slot_of(int'(wr), i))] <= s_ext[4*SLOT_BITS-1-i*SLOT_BITS -: SLOT_BITS];
+                    mem[b][row_of(slot_of(int'(wr), i))] <= s_ext[EXT_BITS-1-i*CHUNK_BITS -: CHUNK_BITS];
                 end
             end
         end
@@ -97,7 +97,7 @@ module aou_chunk_fifo #(
 
 `ifndef SYNTHESIS
     initial begin
-        if (!(BANKS == 1 || BANKS == 2 || BANKS == 4) || ROWS < 1) begin
+        if (BANKS < 1 || BANKS > MAX_MSG_CHUNKS || (BANKS & (BANKS - 1)) != 0 || ROWS < 1) begin
             $fatal(1, "chunk FIFO requires BANKS of 1/2/4 and ROWS >= 1");
         end
     end

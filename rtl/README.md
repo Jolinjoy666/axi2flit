@@ -1,19 +1,24 @@
-# 协议桥 RTL
+# 转接桥 RTL
 
-两个顶层：`axi2flit_soc` 提供 SoC AXI 从机接口；`flit2mc_target` 提供存储侧逐拍 MC 请求/完成接口。两者以双向 250B Flit 连接，默认 256 位、单 RP，可配置 512/1024 位和 1～4 RP。
+两个顶层：
 
-文件依赖顺序：`aou_pkg.sv` → `aou_sync_fifo.sv`、`aou_flit_tx.sv`、`aou_flit_rx.sv` → `aou_transport.sv` → 两个顶层。编译文件表维护在 [sim/Makefile](../sim/Makefile)。
+- `axi2flit_soc`：SoC 侧，AXI4 从机 ⇄ 250B Flit（接 D2D Adapter 的 FDI）。
+- `flit2hif_target`：存储侧，250B Flit ⇄ MC 的 HIF 主机接口（接存储控制器 MC）。
 
-代码组织约定：可配置的数据位宽、RP 数、FIFO/ROB 深度放在模块 `parameter`；AoU 线上固定的消息类型数、粒度和 AXI ID 数放在 `aou_pkg.sv` 的 `localparam`。模块内信号集中在开头，按用途加中文注释；组合计算、子模块连接与时序更新各自成块。修改协议固定宽度时，须同步检查线上字段索引和对接文档。
+例化层次：
 
-参数越界的 `$fatal` 只用于仿真；综合时需定义 `SYNTHESIS` 并使用合法参数。实际综合结果仍需由目标综合工具验证。
+```
+axi2flit_soc
+└── aou_transport ── aou_flit_tx、aou_flit_rx、aou_sync_fifo / aou_chunk_fifo（接收缓冲）
+flit2hif_target
+└── aou_target_core ── aou_transport（同上）、aou_sync_fifo（响应发送队列）
+aou_pkg：协议常量、消息格式与编解码函数，各模块 import
+```
 
-模块例化的每个参数和端口各占一行，使用显式 `.端口名(信号名)` 连接；有意不使用的 FIFO `level` 输出保留 `.level()` 标记。
+编译顺序：`aou_pkg.sv` → `aou_sync_fifo.sv`、`aou_chunk_fifo.sv`、`aou_flit_tx.sv`、`aou_flit_rx.sv` →
+`aou_transport.sv` → `aou_target_core.sv` → `axi2flit_soc.sv`、`flit2hif_target.sv`。文件表维护在 [sim/Makefile](../sim/Makefile) 的 `RTL` 变量。
 
-`aou_sync_fifo` 的 `FWFT` 默认为 0，桥内全部 FIFO 例化也显式选用 0，维持空队列入队后下拍输出；设为 1 时，空队列的输入可在同拍直接成为输出，若两侧同时握手则不占用存储。两种模式均保持 ready/valid 背压和满队列同拍出入规则。
+约定：可配置项（数据位宽、RP 数、各级深度、HIF 控制器配置等）是模块 `parameter`；AoU 线上格式固定的量是
+`aou_pkg` 的 `localparam`，两端必须一致。参数越界的 `$fatal` 只用于仿真，综合时定义 `SYNTHESIS`。
 
-- [设计与完整接口表](../doc/RTL协议桥设计与接口说明.md)：端口、时序、MC 完成契约、credit、参数和限制。
-- [测试入口与结果](../doc/RTL协议桥验证说明.md)：功能、异常、性能和波形。
-- [吞吐优化与场景配置](../doc/RTL吞吐优化与场景配置.md)：双帧窗口、每拍一条消息、credit 容量和可选满载/物理模型。
-
-该目录不含测试内存、物理 UCIe 链路或 DFI 控制器；仿真激励和记分板位于 `sim/tb/`。本版为寄存器级实现与仿真基线，尚无工艺综合/时序签核证据。
+设计说明见 [doc/设计文档](../doc/设计文档/)。仿真模型（HIF 控制器模型、满速 MC 模型）在 `sim/model/`，不属于交付 RTL。
