@@ -47,7 +47,7 @@ constexpr double HIF_GBPS = 1e9;
 #endif
 // 两端接收深度，仅用于报告；须与 fl_rtl_top.sv 的同名宏一致（Makefile 同时传给两边）。
 #ifndef FL_RDATA_DEPTH
-#define FL_RDATA_DEPTH 24
+#define FL_RDATA_DEPTH (FL_DATA_WIDTH < 1024 ? 32 : 24)
 #endif
 #ifndef FL_WRESP_DEPTH
 #define FL_WRESP_DEPTH 24
@@ -59,7 +59,7 @@ constexpr double HIF_GBPS = 1e9;
 #define FL_RREQ_DEPTH 32
 #endif
 #ifndef FL_WDATA_DEPTH
-#define FL_WDATA_DEPTH 24
+#define FL_WDATA_DEPTH (FL_DATA_WIDTH < 1024 ? 36 : 24)
 #endif
 #ifndef FL_TX_DEPTH
 #define FL_TX_DEPTH 2

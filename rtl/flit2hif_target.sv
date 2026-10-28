@@ -14,7 +14,7 @@ module flit2hif_target #(
     // 接收缓冲深度（全宽消息条数）与响应队列深度，含义同 flit2mc_target。
     parameter int WREQ_DEPTH = 24,
     parameter int RREQ_DEPTH = 32,
-    parameter int WDATA_DEPTH = 24,
+    parameter int WDATA_DEPTH = DATA_WIDTH < 1024 ? 36 : 24,  // 写数据往返比读数据长，见设计文档 6.1 节
     parameter int RESPONSE_DEPTH = 2,
     // ---- 控制器配置：与 MC 的同名配置参数一致 ----
     parameter int MEMC_DRAM_DATA_WIDTH = 32,
@@ -127,16 +127,25 @@ module flit2hif_target #(
     localparam logic [1:0] CMD_WR = 2'b00, CMD_RD = 2'b01, CMD_RMW = 2'b10;
     localparam logic [1:0] RESP_OKAY = 2'b00, RESP_SLVERR = 2'b10, RESP_DECERR = 2'b11;
 
+    // 地址分两段：突发不跨 4KB（接收时已检查），突发内的地址运算只用页内 12 位偏移；
+    // 页对应的 HIF 字地址在接收请求时算一次并锁存，发命令时与行偏移拼接。
+    localparam int PAGE_SHIFT = 12;
     typedef logic [WIRE_ADDR_W-1:0] addr_t;
-    function automatic addr_t line_of(input addr_t a);
-        return a & ~addr_t'(LINE_BYTES - 1);
+    typedef logic [PAGE_SHIFT-1:0] off_t;
+    typedef logic [CORE_ADDR_WIDTH-1:0] hif_addr_t;
+    function automatic off_t line_of(input off_t a);
+        return a & ~off_t'(LINE_BYTES - 1);
     endfunction
     function automatic logic in_window(input addr_t a);
         // 低于基址时差值回绕为大数，同样落在窗口外。
         return a - ADDR_BASE < MEM_BYTES;
     endfunction
-    function automatic logic [CORE_ADDR_WIDTH-1:0] hif_addr_of(input addr_t a);
-        return CORE_ADDR_WIDTH'((a - ADDR_BASE) >> WORD_SHIFT);
+    // 页起始的 HIF 字地址；ADDR_BASE 按 4KB 对齐，页内偏移不参与减法。
+    function automatic hif_addr_t page_hif_of(input addr_t a);
+        return hif_addr_t'(((a - ADDR_BASE) >> PAGE_SHIFT) << (PAGE_SHIFT - WORD_SHIFT));
+    endfunction
+    function automatic hif_addr_t hif_addr_of(input hif_addr_t page, input off_t off);
+        return page | hif_addr_t'(off >> WORD_SHIFT);
     endfunction
     function automatic logic [1:0] worse(input logic [1:0] a, input logic [1:0] b);
         return a > b ? a : b;
@@ -207,7 +216,7 @@ module flit2hif_target #(
         logic [RP_W-1:0] rp;
         logic [WIRE_ID_W-1:0] id;
         logic [WIRE_USER_W-1:0] user;
-        addr_t addr;
+        off_t off;
         logic [2:0] size;
         logic [7:0] len;
         logic outside;
@@ -218,13 +227,14 @@ module flit2hif_target #(
 
     // 读发起：一次处理一个突发，按行发命令。
     logic r_busy, r_hpr;
-    addr_t r_line;
+    off_t r_line;
+    hif_addr_t r_page;
     logic [NLW-1:0] r_left;
     int unsigned r_next_rp;
     int r_sel;
     ax_t r_req;
     logic r_start, r_want;
-    addr_t r_first, r_last_line;
+    off_t r_first, r_last_line;
 
     // 读 ROB：环形队列，按发出顺序分配与退休，完成可乱序。
     logic [LINE_BITS-1:0] rob_data [RD_LINES];
@@ -244,8 +254,9 @@ module flit2hif_target #(
             end
         end
         r_req = r_sel >= 0 ? get_req(rx_data[r_sel][K_RREQ]) : '0;
-        r_first = line_of(r_req.addr);
-        r_last_line = line_of(r_req.addr + ((addr_t'(r_req.len) + 1) << r_req.size) - 1);
+        // 末字节偏移不超过 4095（突发不跨 4KB），16 位中间量足够容纳 256 拍 × 128B。
+        r_first = line_of(off_t'(r_req.addr));
+        r_last_line = line_of(off_t'(16'(r_req.addr[PAGE_SHIFT-1:0]) + ((16'(r_req.len) + 16'd1) << r_req.size) - 16'd1));
         // 上一个突发的行全部发出后才接收下一个；接收即出队，字段锁存在发起寄存器与上下文中。
         r_start = active && !r_busy && r_sel >= 0 && rc_count < RD_BURSTS;
         r_want = active && r_busy && rob_count < RD_LINES &&
@@ -255,7 +266,7 @@ module flit2hif_target #(
     // 读退休：队首突发逐拍输出，所需的行在 ROB 头部且已完成时组装一拍 RDATA。
     rctx_t rh;
     logic [8:0] rt_beat;
-    addr_t rt_addr;
+    off_t rt_addr;
     int rt_bytes, rt_need, rt_pop;
     logic rt_ready, rt_fire, rt_last;
     logic [1:0] rt_resp;
@@ -265,7 +276,7 @@ module flit2hif_target #(
 
     always_comb begin
         rh = rctx[rc_head];
-        rt_addr = rh.addr + (addr_t'(rt_beat) << rh.size);
+        rt_addr = rh.off + off_t'(16'(rt_beat) << rh.size);
         rt_bytes = 1 << rh.size;
         rt_need = rh.outside ? 0 : (rt_bytes >= LINE_BYTES ? rt_bytes / LINE_BYTES : 1);
         rt_last = rt_beat == {1'b0, rh.len};
@@ -283,7 +294,7 @@ module flit2hif_target #(
         end
         // 窄传输的末拍未写到行尾时也要释放该行。
         rt_pop = rt_bytes >= LINE_BYTES ? rt_need :
-                 (!rh.outside && (((rt_addr + addr_t'(rt_bytes)) & addr_t'(LINE_BYTES - 1)) == 0 || rt_last)) ? 1 : 0;
+                 (!rh.outside && (((rt_addr + off_t'(rt_bytes)) & off_t'(LINE_BYTES - 1)) == 0 || rt_last)) ? 1 : 0;
     end
 
     always_comb begin
@@ -338,7 +349,10 @@ module flit2hif_target #(
     // 写组装：一次处理一个突发；w_part 为大于一行的拍内正在发出的行序号。
     logic w_busy, w_outside;
     logic [RP_W-1:0] w_rp;
-    ax_t w_req;
+    off_t w_off;
+    hif_addr_t w_page;
+    logic [2:0] w_size;
+    logic [7:0] w_len;
     logic [8:0] w_beat;
     logic [NLW-1:0] w_part;
     logic [WBW-1:0] w_ctx;
@@ -346,7 +360,7 @@ module flit2hif_target #(
     int w_sel;
     ax_t w_sel_req;  // 被选中 RP 的写请求
     logic w_start, w_have, w_bad_len, w_beat_bad, w_last_beat, w_last_part, w_emit, w_want, w_consume;
-    addr_t w_addr, w_line;
+    off_t w_addr, w_line;
     int w_bytes, w_parts;
     logic [LANE_W-1:0] w_lane;
     logic [DATA_WIDTH-1:0] w_bus;
@@ -390,12 +404,12 @@ module flit2hif_target #(
 
         // 当前拍：地址、字节通道、本拍需要拆成的行数与本部分所在的行。
         w_have = active && w_busy && rx_valid[w_rp][K_WDATA];
-        w_addr = w_req.addr + (addr_t'(w_beat) << w_req.size);
-        w_bytes = 1 << w_req.size;
+        w_addr = w_off + off_t'(16'(w_beat) << w_size);
+        w_bytes = 1 << w_size;
         w_lane = LANE_W'(w_addr % DATA_BYTES);
         w_parts = w_bytes >= LINE_BYTES ? w_bytes / LINE_BYTES : 1;
-        w_line = line_of(w_addr) + addr_t'(w_bytes >= LINE_BYTES ? int'(w_part) * LINE_BYTES : 0);
-        w_last_beat = w_beat == {1'b0, w_req.len};
+        w_line = line_of(w_addr) + off_t'(w_bytes >= LINE_BYTES ? int'(w_part) * LINE_BYTES : 0);
+        w_last_beat = w_beat == {1'b0, w_len};
         w_last_part = int'(w_part) == w_parts - 1;
         w_bus = DATA_WIDTH'(get_data(rx_data[w_rp][K_WDATA], DATA_WIDTH));
         w_strb = (DATA_WIDTH/8)'(get_strb(rx_data[w_rp][K_WDATA], w_lane));
@@ -408,7 +422,7 @@ module flit2hif_target #(
             end
         end
         // 行写满（本部分写到行尾）或突发结束时发出写命令。
-        w_emit = w_bytes >= LINE_BYTES || (((w_addr + addr_t'(w_bytes)) & addr_t'(LINE_BYTES - 1)) == 0) ||
+        w_emit = w_bytes >= LINE_BYTES || (((w_addr + off_t'(w_bytes)) & off_t'(LINE_BYTES - 1)) == 0) ||
                  (w_last_beat && w_last_part);
     end
     // 发命令所需资源：空闲写缓冲槽、WR credit；RMW 另需 LPR credit。
@@ -509,7 +523,7 @@ module flit2hif_target #(
         cmd_is_hpr = r_hpr;
         cmd_is_rmw = grant_wr && ECC_RMW && !(&merged_mask);
         hif_cmd_type = !grant_wr ? CMD_RD : cmd_is_rmw ? CMD_RMW : CMD_WR;
-        hif_cmd_addr = hif_addr_of(grant_wr ? w_line : r_line);
+        hif_cmd_addr = grant_wr ? hif_addr_of(w_page, w_line) : hif_addr_of(r_page, r_line);
         hif_cmd_pri = (!grant_wr && r_hpr) ? (VPRW_EN ? HIF_PRI_BITS'(2) : HIF_PRI_BITS'(1)) : '0;
         hif_cmd_token = CORE_TAG_WIDTH'(rob_tail);
         hif_cmd_length = '0;                         // 读整行
@@ -560,6 +574,7 @@ module flit2hif_target #(
             r_busy <= 0;
             r_hpr <= 0;
             r_line <= '0;
+            r_page <= '0;
             r_left <= '0;
             r_next_rp <= 0;
             rc_head <= '0;
@@ -583,7 +598,10 @@ module flit2hif_target #(
             w_busy <= 0;
             w_outside <= 0;
             w_rp <= '0;
-            w_req <= '0;
+            w_off <= '0;
+            w_page <= '0;
+            w_size <= '0;
+            w_len <= '0;
             w_beat <= '0;
             w_part <= '0;
             w_ctx <= '0;
@@ -619,13 +637,14 @@ module flit2hif_target #(
 
             // ---- 读发起 ----
             if (r_start) begin
-                rctx[rc_tail] <= '{rp: RP_W'(r_sel), id: r_req.id, user: r_req.user, addr: r_req.addr,
+                rctx[rc_tail] <= '{rp: RP_W'(r_sel), id: r_req.id, user: r_req.user, off: off_t'(r_req.addr),
                                    size: r_req.size, len: r_req.len, outside: !in_window(r_req.addr)};
                 rc_tail <= rc_tail == RBW'(RD_BURSTS - 1) ? '0 : rc_tail + 1'b1;
                 r_next_rp <= unsigned'((r_sel + 1) % RP_COUNT);
                 if (in_window(r_req.addr)) begin
                     r_busy <= 1;
                     r_line <= r_first;
+                    r_page <= page_hif_of(r_req.addr);
                     r_left <= NLW'(((r_last_line - r_first) >> LINE_SHIFT) + 1);
                     r_hpr <= int'(r_req.qos) >= HPR_QOS;
                 end
@@ -636,7 +655,7 @@ module flit2hif_target #(
                 rob_err[rob_tail] <= RESP_OKAY;
                 rob_words[rob_tail] <= '0;
                 rob_tail <= rob_tail == RLW'(RD_LINES - 1) ? '0 : rob_tail + 1'b1;
-                r_line <= r_line + addr_t'(LINE_BYTES);
+                r_line <= r_line + off_t'(LINE_BYTES);
                 r_left <= r_left - 1'b1;
                 if (r_left == 1) begin
                     r_busy <= 0;
@@ -678,7 +697,10 @@ module flit2hif_target #(
             if (w_start) begin
                 w_busy <= 1;
                 w_rp <= RP_W'(w_sel);
-                w_req <= w_sel_req;
+                w_off <= off_t'(w_sel_req.addr);
+                w_page <= page_hif_of(w_sel_req.addr);
+                w_size <= w_sel_req.size;
+                w_len <= w_sel_req.len;
                 w_outside <= !in_window(w_sel_req.addr);
                 w_beat <= '0;
                 w_part <= '0;

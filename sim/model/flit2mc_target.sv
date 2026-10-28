@@ -13,7 +13,7 @@ module flit2mc_target #(
     // 接收缓冲深度（全宽消息条数），决定向对端公布的 WREQ/RREQ/WDATA credit。
     parameter int WREQ_DEPTH = 24,
     parameter int RREQ_DEPTH = 32,
-    parameter int WDATA_DEPTH = 24,
+    parameter int WDATA_DEPTH = DATA_WIDTH < 1024 ? 36 : 24,  // 写数据往返比读数据长，见设计文档 6.1 节
     parameter int RESPONSE_DEPTH = 2,
     parameter int MC_RD_SLOTS = 16,
     parameter int MC_WR_SLOTS = 16,

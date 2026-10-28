@@ -7,8 +7,9 @@ module aou_target_core #(
     // 接收缓冲深度（全宽消息条数），决定向对端公布的 WREQ/RREQ/WDATA credit。
     parameter int WREQ_DEPTH = 24,
     parameter int RREQ_DEPTH = 32,
-    parameter int WDATA_DEPTH = 24,
-    // 每个 RP 的读数据、写响应发送队列深度；组帧器每拍取一条，深度 1 即可满速，满时反压后端。
+    parameter int WDATA_DEPTH = DATA_WIDTH < 1024 ? 36 : 24,  // 写数据往返比读数据长，见设计文档 6.1 节
+    // 每个 RP 的读数据、写响应发送队列深度（≥ 2）。reply_ready 取自"队列未满"，不等同拍出队，
+    // 深度 2 时组帧器每拍取一条仍不断流；满时反压后端。
     parameter int RESPONSE_DEPTH = 2
 ) (
     input logic clk,
@@ -80,7 +81,7 @@ module aou_target_core #(
                 ) u_fifo (
                     .clk(clk),
                     .rst_n(rst_n),
-                    .wr_en(reply_valid[rp][q]),
+                    .wr_en(reply_valid[rp][q] && reply_ready[rp][q]),
                     .wr_data(reply_data[rp][q][MSG_BITS-1 -: W]),
                     .full(full),
                     .rd_en(tx_ready[rp][q]),
@@ -88,7 +89,8 @@ module aou_target_core #(
                     .empty(empty),
                     .level()
                 );
-                assign reply_ready[rp][q] = !full || (tx_ready[rp][q] && !empty);
+                // 只看寄存器状态，组帧器的选择逻辑不串入后端的退休与状态更新。
+                assign reply_ready[rp][q] = !full;
                 assign tx_valid[rp][q] = !empty;
                 assign tx_data[rp][q] = {m_bits, {(MSG_BITS-W){1'b0}}};
             end else begin : g_no_queue
@@ -101,8 +103,8 @@ module aou_target_core #(
 
 `ifndef SYNTHESIS
     initial begin
-        if (WREQ_DEPTH < 1 || RREQ_DEPTH < 1 || WDATA_DEPTH < 1 || RESPONSE_DEPTH < 1) begin
-            $fatal(1, "Target FIFO depths must be positive");
+        if (WREQ_DEPTH < 1 || RREQ_DEPTH < 1 || WDATA_DEPTH < 1 || RESPONSE_DEPTH < 2) begin
+            $fatal(1, "Target FIFO depths must be positive and RESPONSE_DEPTH >= 2");
         end
     end
 `endif

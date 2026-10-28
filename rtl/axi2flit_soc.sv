@@ -13,9 +13,11 @@ module axi2flit_soc #(
     parameter int TX_DEPTH = 2,
     // 写路由 FIFO 深度：已接受 AW、W 尚未收完的写突发数，即 AW 最多可领先 W 的笔数。
     parameter int WR_ROUTE_DEPTH = 8,
-    // 接收缓冲深度（单位：全宽消息条数（27粒度）），决定向对端公布的 RDATA/WRESP credit。
-    parameter int RDATA_DEPTH = 24,  // 每个RP的读数据接收容量
-    parameter int WRESP_DEPTH = 24,  // 每个RP的写响应接收容量
+    // 每个 RP 的接收缓冲深度（单位：本端全宽消息条数），决定向对端公布的 RDATA/WRESP credit。
+    // 读数据深度 ≈ credit 往返时间 ÷ 消息间隔：256/512 位时每 2ns 一条，约 53ns 往返需 27 条，取 32；
+    // 1024 位时受链路限制约 3ns 一条，需 19 条，取 24。推导见设计文档 6.1 节。
+    parameter int RDATA_DEPTH = DATA_WIDTH < 1024 ? 32 : 24,
+    parameter int WRESP_DEPTH = 24,
     // 读、写最大在途事务数（已握手 AR/AW、尚未返回 RLAST/B 的笔数），即在途表项数；表满时背压 ARREADY/AWREADY。
     parameter int RD_OUTSTANDING = 32,
     parameter int WR_OUTSTANDING = 32,

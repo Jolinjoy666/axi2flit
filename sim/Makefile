@@ -11,9 +11,10 @@ JOBS ?= 2
 DEPTH ?= 3
 FWFT ?= 1
 LINK_DEPTH ?= 64
-RDATA_DEPTH ?= 24
+# 读/写数据接收深度默认随位宽取（推导见设计文档 6.1 节）：256/512 位 32/36，1024 位 24/24。
+RDATA_DEPTH ?= $(if $(filter 1024,$(WIDTH)),24,32)
 WRESP_DEPTH ?= 24
-WDATA_DEPTH ?= 24
+WDATA_DEPTH ?= $(if $(filter 1024,$(WIDTH)),24,36)
 WREQ_DEPTH ?= 24
 RREQ_DEPTH ?= 32
 RESPONSE_DEPTH ?= 2
