@@ -440,6 +440,69 @@ tab("errs", "异常检测", ["位置", "条件", "处理"], [
 p("protocol_error 保持到复位，应接到中断或状态寄存器，由软件组织两端协同复位。")
 
 # =====================================================================
+h1("当前保留与后续扩展点")
+p("本节记录设计中有意保留但未完整实现的字段或信号，以及对应的扩展方向。所有保留字段均已在消息格式或接口定义中占位，"
+  "未来扩展时不需要改变线上格式的其余部分，两端可独立迭代。")
+
+h2("AXI 属性：透传但存储侧未使用")
+tab("ext_axi", "AXI 保留字段一览", ["字段", "当前行为", "扩展方向"],
+    [
+        ["AWPROT / ARPROT（3 位）",
+         "随 WREQ / RREQ 消息透传到存储侧（req_hdr_t.prot），存储侧不读取",
+         "在存储侧按地址窗口和 PROT 位做安全域准入检查；Non-secure 请求不能访问 Secure 内存区域时回 DECERR"],
+        ["AWCACHE / ARCACHE（4 位）",
+         "随 WREQ / RREQ 消息透传（req_hdr_t.cache），存储侧不读取",
+         "Modifiable 位可影响 DRAM 调度策略（Non-modifiable 事务不应被 ROB 乱序）；大多数控制器将此留给软件配置"],
+        ["AWLOCK / ARLOCK（独占访问）",
+         "透传到消息（req_hdr_t.lock），存储侧按普通访问处理并返回 OKAY；"
+         "AXI 规定不支持独占的从机返回 OKAY 是合规行为",
+         "支持独占需要在 ROB 里增加预约（reservation）逻辑，对应 HIF 的 RMW 命令路径（ECC_RMW 参数已开放此路径）"],
+        ["WUSER（写数据用户信号）",
+         "随 WDATA 消息头透传到存储侧（wdata_hdr_t.user），存储侧不使用；BUSER 回环的是 AWUSER",
+         "可携带每拍辅助信息（如毒化标记、ECC 保护位）；需要在存储侧写组装逻辑中增加相应处理，SoC 侧无需改动"],
+    ],
+    [5.2, 5.0, 6.0])
+p("AWBURST = INCR 以外的突发类型（FIXED、WRAP）目前在 SoC 侧判为非法。FIXED 对 DRAM 无意义；WRAP 用于 cache 行填充，"
+  "支持需要在地址计算中增加 wrap 边界逻辑，目前的 legal_req 函数直接按 INCR 处理。")
+p("AXI REGION / DOMAIN 信号未引入端口，如需多区域路由或多集群 snoop 可增加对应参数并扩展消息头保留字段。")
+
+h2("HIF 接口：保留信号恒为固定值")
+tab("ext_hif", "HIF 保留信号一览", ["信号", "当前值", "扩展方向"],
+    [
+        ["hif_go2critical_lpr / hpr / wr",
+         "恒为 0",
+         "当 ROB 接近满、或高优先级命令等待超过阈值时，拉高对应信号；控制器收到后压缩预充电间隔或减少低优先级命令，"
+         "降低读延迟。适合对延迟敏感的应用场景"],
+        ["hif_cmd_autopre",
+         "恒为 0",
+         "对访问模式随机（同一 DRAM row 重用率低）的工作负载，可将 autopre 置 1，让控制器在读写后立即关行，"
+         "减少下一次访问不同行时的等待"],
+        ["hif_cmd_latency",
+         "恒为 0",
+         "部分控制器版本用于 VPRW（Virtual Private Read/Write）调度提示；可按请求的优先级或 QOS 赋值"],
+        ["hif_cmd_length",
+         "恒为 0（读整行）",
+         "非零值表示部分行访问；当前桥按整行收发，不需要改变"],
+    ],
+    [5.2, 2.4, 8.6])
+
+h2("消息格式：保留位")
+p("协议消息头中的保留位（rsvd）目前发送时固定为 0，接收侧对 rdata_hdr_t.rsvd 和 wresp_hdr_t.rsvd0/rsvd1 核对非零即报错；"
+  "req_hdr_t.rsvd 接收侧不核对。扩展时需同时修改两端，且不核对的字段优先被复用：")
+li("req_hdr_t.rsvd（1 位）：最容易扩展。可用于版本协商位或跨 RP 转发标志，两端需同步升级。")
+li("rdata_hdr_t.rsvd（3 位）：当前核对为 0，扩展前需先去掉接收侧的合法性检查，再协商新含义，否则老存储侧会报 protocol_error。")
+li("wresp_hdr_t.rsvd0（2 位）、rsvd1（4 位）：同上，现核对为 0。")
+
+h2("多消息类型与多端口扩展")
+p("消息类型字段 mtype 为 4 位，当前分配了 6 个值（WREQ / RREQ / WDATA / WDATAFULL / RDATA / WRESP），"
+  "还有大量未分配值可用。新增消息类型（如原子操作、cache 无效化、Snoop 请求）无需改变帧格式，"
+  "只需在 aou_pkg.sv 里增加结构体和编解码函数，以及在两端的接收 case 分支里加处理。")
+p("RP_COUNT 已参数化，所有队列、credit 账本和 case 分支均按 RP 展开；增加 RP 数等同于增加独立的 QOS 信道，"
+  "不需要改变帧格式或传输层逻辑。")
+p("存储侧接口已通过 aou_target_core 隔离：axi2flit_soc 和 flit2hif_target 均只使用 rx_* / reply_* 两组接口，"
+  "可以独立替换存储侧实现（如 CXL 协议转换、DDR PHY 直驱、多控制器路由），传输层和 SoC 侧均无需修改。")
+
+# =====================================================================
 h1("可配置参数")
 p("参数分为三类：两端必须一致的、各端独立的、以及与存储控制器一致的。协议线上格式由 aou_pkg 常量固定，不可配置。")
 h2("两端一致")
@@ -690,10 +753,14 @@ code("延迟  单拍读  72 ns = SoC发送 6 + 链路 10 + 存储侧请求 8 + H
      "指标  速率 24 GT/s | 带宽利用率 35.6%（受 16 GB/s HIF 数据口限制） | 桥延迟 SoC 侧 12 ns、存储侧 18 ns")
 p("带宽未达预期时，先对照 8.2 节的各环节上限找出瓶颈，再看对应的深度、行数或 credit 参数是否足够（6.1、6.2 节）。")
 h2("查看波形")
-code("make -C sim run WIDTH=1024 ARGS=--trace           # 独立环境 VCD：sim/results/rtl_1024_rp1.vcd\n"
-     "make -C sim fl-wave WIDTH=1024 TC=2               # 全链路 VCD 并用 GTKWave 打开\n"
-     "make -C sim fl-vcs WIDTH=1024 TC=2 && make -C sim fl-verdi WIDTH=1024   # VCS + Verdi（FSDB）")
-p("全链路波形中 tb_case 信号为当前用例编号（20 为空载延迟测量），RTL 在 fl_rtl_top 下，HIF 信号为 fl_rtl_top.hif_*。")
+code("make -C sim fsdb  WIDTH=256                      # 独立环境：Verilator 仿真并生成 sim/results/rtl_256_rp1.fsdb\n"
+     "make -C sim verdi WIDTH=256                      # 编译设计库并用 Verdi 打开（配置变量须与 fsdb 一致）\n"
+     "make -C sim fl-vcs WIDTH=256 TC=5,9              # 全链路：VCS 仿真，只跑用例 5、9，生成 FSDB\n"
+     "make -C sim fl-verdi WIDTH=256                   # 用 Verdi 打开全链路波形")
+p("两种方式都同时加载设计库与 FSDB，可在 Instance 窗口浏览层次、在源码中选中信号按 Ctrl+W 加入波形、"
+  "在波形上双击跳变追踪驱动源。独立环境的 RTL 在 TOP.tb_rtl_bridge 下（soc、target 为两端桥），激励由 C++ 产生，"
+  "不在设计库中；全链路的 RTL 在 fl_rtl_top 下，tb_case 信号为当前用例编号（20 为空载延迟测量），"
+  "HIF 信号为 fl_rtl_top.hif_*。")
 
 render(FIG_DIR, SPEC_DIR, OUT, ("AXI2FLIT 转接桥", "RTL 设计文档"), "设计说明 · 接口定义 · 性能与验证",
        [("版本", "V2.0"), ("日期", "2026 年 10 月")])

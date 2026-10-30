@@ -53,9 +53,10 @@ ifeq ($(filter hif ideal,$(MC_IF)),)
 $(error MC_IF 只能为 hif 或 ideal)
 endif
 HIF_TAG := _hif_d$(HIF_DRAM_W)r$(HIF_RATIO)b$(HIF_BL)_l$(HIF_RD_LINES)-$(HIF_WR_LINES)_c$(HIF_LPR)-$(HIF_HPR)-$(HIF_WR)x$(HIF_CREDIT_BITS)$(if $(filter 1,$(HIF_ECC_RMW)),_rmw)
-HIF_VFLAGS := +define+TB_MC_HIF -GHIF_DRAM_W=$(HIF_DRAM_W) -GHIF_RATIO=$(HIF_RATIO) -GHIF_BL=$(HIF_BL) \
-  -GHIF_RD_LINES=$(HIF_RD_LINES) -GHIF_WR_LINES=$(HIF_WR_LINES) -GHIF_LPR=$(HIF_LPR) -GHIF_HPR=$(HIF_HPR) \
-  -GHIF_WR=$(HIF_WR) -GHIF_CREDIT_BITS=$(HIF_CREDIT_BITS) -GHIF_ECC_RMW=$(HIF_ECC_RMW) -GHIF_LATENCY=$(HIF_LATENCY)
+HIF_GPARAMS := HIF_DRAM_W=$(HIF_DRAM_W) HIF_RATIO=$(HIF_RATIO) HIF_BL=$(HIF_BL) HIF_RD_LINES=$(HIF_RD_LINES) \
+  HIF_WR_LINES=$(HIF_WR_LINES) HIF_LPR=$(HIF_LPR) HIF_HPR=$(HIF_HPR) HIF_WR=$(HIF_WR) \
+  HIF_CREDIT_BITS=$(HIF_CREDIT_BITS) HIF_ECC_RMW=$(HIF_ECC_RMW) HIF_LATENCY=$(HIF_LATENCY)
+HIF_VFLAGS := +define+TB_MC_HIF $(addprefix -G,$(HIF_GPARAMS))
 HIF_CDEFS := -DTB_MC_HIF -DTEST_HIF_LINE_BYTES=$$(( $(HIF_BL)*$(HIF_DRAM_W)/8 )) \
   -DTEST_HIF_CORE_BYTES=$$(( $(HIF_DRAM_W)*$(HIF_RATIO)*2/8 )) -DTEST_HIF_LPR=$(HIF_LPR) -DTEST_HIF_HPR=$(HIF_HPR) -DTEST_HIF_WR=$(HIF_WR)
 # 仅供测试平台打印配置用，与 -G 参数保持一致。
@@ -75,6 +76,11 @@ MODEL := $(if $(HIF),$(ROOT)/sim/model/hif_mc_model.sv,$(IDEAL_MODEL))
 VFLAGS := --assert --timescale 1ns/1ps --unroll-count 2048 \
           -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC
 .PHONY: lint build run test-all negative perf perf-all mixed checker-negative fifo fifo-all check help hif-cfg-all ideal-all
+# 独立环境顶层 tb_rtl_bridge 的参数（Verilator -G 与 Verdi 外层顶层共用）。
+SA_GPARAMS := DATA_WIDTH=$(WIDTH) RP_COUNT=$(RP) LINK_DEPTH=$(LINK_DEPTH) RDATA_DEPTH=$(RDATA_DEPTH) \
+  WRESP_DEPTH=$(WRESP_DEPTH) WDATA_DEPTH=$(WDATA_DEPTH) WREQ_DEPTH=$(WREQ_DEPTH) RREQ_DEPTH=$(RREQ_DEPTH) \
+  RESPONSE_DEPTH=$(RESPONSE_DEPTH) MC_RD_SLOTS=$(MC_RD_SLOTS) MC_WR_SLOTS=$(MC_WR_SLOTS) TX_DEPTH=$(TX_DEPTH) \
+  WR_ROUTE_DEPTH=$(WR_ROUTE_DEPTH) RD_OUTSTANDING=$(RD_OUTSTANDING) WR_OUTSTANDING=$(WR_OUTSTANDING)
 # 交付的两个顶层，另检查满速 MC 模型（仿真模型）。
 lint:
 	$(VERILATOR) --lint-only $(VFLAGS) --top-module axi2flit_soc -GDATA_WIDTH=$(WIDTH) -GRP_COUNT=$(RP) $(RTL)
@@ -86,11 +92,7 @@ build:
 	@mkdir -p $(BUILD)
 	@echo "编译 tb_rtl_bridge  WIDTH=$(WIDTH) RP=$(RP) MC_IF=$(MC_IF)（日志 $(BUILD)/build.log）"
 	@$(VERILATOR) --cc --exe --build -j $(JOBS) --trace $(VFLAGS) $(if $(HIF),$(HIF_VFLAGS)) \
-	  --top-module tb_rtl_bridge -GDATA_WIDTH=$(WIDTH) -GRP_COUNT=$(RP) \
-	  -GLINK_DEPTH=$(LINK_DEPTH) -GRDATA_DEPTH=$(RDATA_DEPTH) -GWRESP_DEPTH=$(WRESP_DEPTH) -GWDATA_DEPTH=$(WDATA_DEPTH) \
-	  -GWREQ_DEPTH=$(WREQ_DEPTH) -GRREQ_DEPTH=$(RREQ_DEPTH) -GRESPONSE_DEPTH=$(RESPONSE_DEPTH) \
-	  -GMC_RD_SLOTS=$(MC_RD_SLOTS) -GMC_WR_SLOTS=$(MC_WR_SLOTS) -GTX_DEPTH=$(TX_DEPTH) -GWR_ROUTE_DEPTH=$(WR_ROUTE_DEPTH) \
-	  -GRD_OUTSTANDING=$(RD_OUTSTANDING) -GWR_OUTSTANDING=$(WR_OUTSTANDING) \
+	  --top-module tb_rtl_bridge $(addprefix -G,$(SA_GPARAMS)) \
 	  --Mdir $(BUILD) $(RTL) $(MODEL) $(ROOT)/sim/tb/tb_rtl_bridge.sv $(ROOT)/sim/tb/tb_rtl_bridge.cpp \
 	  -CFLAGS "-std=c++17 -DAXI_DATA_WIDTH_CFG=$(WIDTH) -DTEST_RP=$(RP) -DTEST_RX_DEPTH=$(RDATA_DEPTH) -DTEST_WDATA_DEPTH=$(WDATA_DEPTH) $(TEST_CDEFS) $(if $(HIF),$(HIF_CDEFS)) -I$(ROOT)/systemc/include -I$(SYSTEMC_HOME)/include" \
 	  -LDFLAGS '-L$(SYSTEMC_HOME)/lib -Wl,-rpath,$(SYSTEMC_HOME)/lib -lsystemc' \
@@ -99,6 +101,29 @@ build:
 run: build
 	@mkdir -p results
 	@SYSTEMC_DISABLE_COPYRIGHT_MESSAGE=1 $(BUILD)/Vtb_rtl_bridge $(ARGS) | tee results/rtl_$(WIDTH)_rp$(RP)$(RUN_TAG).log
+
+# 独立环境看波形（Verdi）：Verilator 仿真生成 VCD → vcd2fsdb 转为 FSDB（-inst_array 使生成块名为 g_rp[0] 而非转义名）；vericom 把 RTL 与测试顶层编译成
+# Verdi 设计库，外层顶层 TOP 按同一组参数例化 tb_rtl_bridge，使设计层次与 VCD 的 TOP.tb_rtl_bridge.* 一致，
+# 从而可以在源码与波形之间跳转、追踪驱动。测试平台的激励是 C++，不在设计库中。
+#   make fsdb  WIDTH=256 [MC_IF=..] [ARGS=..]   运行并生成 results/rtl_<位宽>_rp<RP><标记>.fsdb
+#   make verdi WIDTH=256 [MC_IF=..]             打开 Verdi（需先 make fsdb，配置变量须一致）
+SA_FSDB = $(ROOT)/sim/results/rtl_$(WIDTH)_rp$(RP)$(RUN_TAG).fsdb
+SA_VERDI_DIR = $(BUILD)/verdi
+.PHONY: fsdb verdi
+fsdb: build
+	@mkdir -p results $(SA_VERDI_DIR)
+	@SYSTEMC_DISABLE_COPYRIGHT_MESSAGE=1 $(BUILD)/Vtb_rtl_bridge --trace $(ARGS) | tee results/rtl_$(WIDTH)_rp$(RP)$(RUN_TAG).log
+	@echo "转换 FSDB（日志 $(SA_VERDI_DIR)/vcd2fsdb.log）"
+	@cd $(SA_VERDI_DIR) && vcd2fsdb $(ROOT)/sim/results/rtl_$(WIDTH)_rp$(RP).vcd -inst_array -o $(SA_FSDB) > vcd2fsdb.log 2>&1 \
+	  || { tail -20 vcd2fsdb.log; exit 1; }
+	@echo "波形  $(SA_FSDB)；查看：make verdi WIDTH=$(WIDTH) RP=$(RP) MC_IF=$(MC_IF)"
+verdi:
+	@test -f $(SA_FSDB) || { echo "没有波形，先运行 make fsdb WIDTH=$(WIDTH) RP=$(RP) MC_IF=$(MC_IF)"; exit 1; }
+	@mkdir -p $(SA_VERDI_DIR)
+	@python3 $(ROOT)/sim/scripts/gen_verdi_top.py $(SA_VERDI_DIR)/verdi_top.sv $(SA_GPARAMS) $(if $(HIF),$(HIF_GPARAMS))
+	@cd $(SA_VERDI_DIR) && bash $(VERDI_HOME)/bin/vericom -sv -2012 $(if $(HIF),+define+TB_MC_HIF) $(RTL) $(MODEL) \
+	  $(ROOT)/sim/tb/tb_rtl_bridge.sv verdi_top.sv > vericom.log 2>&1 || { tail -20 vericom.log; exit 1; }
+	$(if $(NO_GUI),@echo "设计库就绪：$(SA_VERDI_DIR)/work.lib++",cd $(SA_VERDI_DIR) && verdi -lib work.lib++ -top TOP -ssf $(SA_FSDB) &)
 
 test-all:
 	@set -e; for w in 256 512 1024; do for p in 1 2 4; do \
@@ -289,7 +314,7 @@ fl-verdi:
 help:
 	@echo '存储侧    ：默认 MC_IF=hif（交付设计）；MC_IF=ideal 为满速 MC 模型，测桥 + 链路上限'
 	@echo '独立 RTL  ：make run WIDTH=1024 RP=1 [RDATA_DEPTH=..] [HIF_DRAM_W=32 HIF_RATIO=4 HIF_BL=16 HIF_LPR/HPR/WR=..]'
-	@echo '           make negative；make check（全部回归）；波形：make run ARGS=--trace；运行参数：make run ARGS=--help'
+	@echo '           make negative；make check（全部回归）；波形：make fsdb + make verdi；运行参数：make run ARGS=--help'
 	@echo '全链路    ：make fl WIDTH=1024 RP=1 [TC=13] [FL_ARGS=--stress]；make fl-all；make fl-ideal-all'
 	@echo '           make fl-wave TC=2（GTKWave）；make fl-vcs TC=2 + make fl-verdi；用例列表：make fl FL_ARGS=--help'
 	@echo '单元与其他：make fifo-all / codec-all / lint / hif-cfg-all / ideal-all / perf-all'

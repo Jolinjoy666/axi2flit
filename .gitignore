@@ -45,3 +45,12 @@ doc/axi2flit_design/figures/
 
 # 设计文档的图片与结果数据由 doc/设计文档/src/build.sh 生成
 doc/设计文档/figures/
+
+# Verdi / FSDB 工具在当前目录生成的日志与配置
+verdiLog/
+vcd2fsdbLog/
+fsdb2vcdLog/
+fsdbdebugLog/
+novas.conf
+novas.rc
+novas_dump.log
