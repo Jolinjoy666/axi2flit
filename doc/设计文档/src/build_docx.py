@@ -124,8 +124,8 @@ tab("hif_io", "HIF 接口", ["信号", "方向", "位宽", "说明"], [
     ["hif_cmd_valid", "O", "1", "命令有效"],
     ["hif_cmd_stall", "I", "1", "控制器反压；valid && !stall 的上升沿命令被接收"],
     ["hif_cmd_type", "O", "2", "00 写，01 读，10 RMW（ECC_RMW = 1 时用于部分写）"],
-    ["hif_cmd_addr", "O", "CORE_ADDR_WIDTH", "字地址（单位 MEMC_DRAM_DATA_WIDTH/8 字节），按行对齐"],
-    ["hif_cmd_pri", "O", "HIF_PRI_BITS", "读优先级：LPR 为 0，HPR 为 1（VPRW_EN 时为 2'b10）；写为 0"],
+    ["hif_cmd_addr", "O", "CORE_ADDR_WIDTH", "本行起始的字地址 = (字节地址 − ADDR_BASE) / (MEMC_DRAM_DATA_WIDTH/8)。一个字是 DRAM 数据总线一拍的宽度（默认 4B）；总是行首，低 log2(BL) 位为 0"],
+    ["hif_cmd_pri", "O", "HIF_PRI_BITS", "选择控制器的读队列：0 进低优先级读队列 LPR，1 进高优先级读队列 HPR（控制器开 VPRW 时 HPR 编码为 2'b10）；AxQOS ≥ HPR_QOS 的读走 HPR；写命令恒为 0（普通写）"],
     ["hif_cmd_token", "O", "CORE_TAG_WIDTH", "读命令的 token，等于读 ROB 槽号，读数据带回"],
     ["hif_cmd_length", "O", "CMD_LEN_BITS", "恒为 0，读整行"],
     ["hif_cmd_wdata_ptr", "O", "WDATA_PTR_BITS", "写命令的数据指针，等于写缓冲槽号"],
@@ -137,7 +137,7 @@ tab("hif_io", "HIF 接口", ["信号", "方向", "位宽", "说明"], [
     ["hif_rdata_token", "I", "CORE_TAG_WIDTH", "读数据所属命令的 token"],
     ["hif_rdata", "I", "CORE_DATA_WIDTH", "读数据，一拍一个 HIF 字"],
     ["hif_rdata_addr_err / uncorr_ecc_err / crc_err", "I", "1", "读错误，分别映射为 DECERR / SLVERR / SLVERR"],
-    ["hif_wdata_ptr_valid / hif_wdata_ptr", "I", "1 / WDATA_PTR_BITS", "控制器回送写指针，表示可以送该命令的数据"],
+    ["hif_wdata_ptr_valid / hif_wdata_ptr", "I", "1 / WDATA_PTR_BITS", "控制器请求写数据：ptr 原样回送某条写命令的 hif_cmd_wdata_ptr（即写缓冲槽号），桥随后从该槽读出整行，在 hif_wdata 上连送 LINE_WORDS 拍；回送顺序由控制器决定，可与命令顺序不同"],
     ["hif_wdata_ptr_addr_err", "I", "1", "该写命令地址无效，映射为 DECERR"],
     ["hif_wdata_valid / hif_wdata_stall", "O / I", "1", "写数据握手：valid && !stall 时被接收"],
     ["hif_wdata / hif_wdata_mask / hif_wdata_end", "O", "CORE_DATA_WIDTH / CORE_MASK_WIDTH / 1",
@@ -395,7 +395,7 @@ tab("depth_calc", "读写数据接收深度的计算", ["AXI 位宽", "目标带
 p("实测验证（全链路，16 拍突发）。256 位、HIF 存储侧时改变两个深度：")
 tab("depth_meas", "256 位接收深度与满载吞吐（全链路，HIF 存储侧，GB/s）",
     ["RDATA / WDATA 深度", "读", "写", "读写同时"], [
-    ["24 / 24（原默认）", "14.34", "12.80", "12.73 / 12.12"],
+    ["24 / 24", "14.34", "12.80", "12.73 / 12.12"],
     ["28 / 28", "16.00", "14.34", "14.08 / 13.12"],
     ["32 / 32", "16.00", "15.06", "15.06 / 13.55"],
     ["32 / 36（默认）", "16.00", "15.06", "15.09 / 14.17"],
@@ -642,12 +642,17 @@ tab("tbfiles", "验证文件", ["文件", "内容"], [
     ["sim/Makefile", "编译与回归入口；Verilator 与 VCS 两套流程；MC_IF = hif（默认）/ ideal"],
 ], [5.4, 10.1])
 fig("tb", "f_tb.png", "独立验证环境（HIF 存储侧）")
-p("独立环境中链路 FIFO 按链路带宽限速并可插入停顿。记分板按 AXI 握手维护参考存储，每个 R 拍逐字节比对；"
-  "链路上每条消息与参考编码库生成的字节逐一比较。HIF 控制器模型发现桥超 credit 发命令、token 或写指针重复使用、"
-  "写数据拍数不符等情况时报错。")
+p("{图:tb}中，SV 顶层只做连线：两端桥、两个链路 FIFO（按链路带宽限速，可插入停顿）、HIF 控制器模型与 SVA 握手保持断言；"
+  "C++ 测试平台驱动 AXI、控制链路与控制器模型的停顿，并完成全部检查。检查分四层，任何一层不符即报错退出：")
+li("（1）端到端数据：每次 AXI 写握手更新一份参考存储，每个 R 拍的数据、RRESP、RLAST 与之逐字节比对，每个 B 比对 BRESP。")
+li("（2）链路消息：参考编码模型按 AXI 握手算出每条应发的 AoU 消息，与两个链路 FIFO 上实际流过的字节逐条比对，"
+   "一个比特的编码错误也会被发现。")
+li("（3）HIF 协议：控制器模型每拍检查桥是否超 credit 发命令、token 或写指针重复使用、写数据拍数不符。")
+li("（4）结束清点：每个阶段结束时，所有期望的消息与响应都必须已收到，没有残留的在途事务。")
 fig("fulllink", "f_fulllink.png", "全链路联合仿真环境")
 p("全链路环境中，Flit 端口经 FDI 适配接入事务级 UcieLink 模型（两端 D2D Adapter 含 CRC 与重传，PHY 按 x8 · 24GT/s · "
-  "PAM4 逐 UI 计时）。同一份测试平台可用 Verilator + GTKWave 或 VCS + Verdi 编译运行。")
+  "PAM4 逐 UI 计时）。测试平台是 SystemC 模块，每个用例由 run_case(编号, 名称, 内容) 包装，自动记录时长与延迟并在结束时"
+  "清点；同一份测试平台可用 Verilator 或 VCS 编译。两种环境的配置项、用例的修改方法与波形查看见附录 A。")
 
 h2("测试项")
 tab("tests", "测试项", ["编号", "测试项", "命令（工程根目录）", "内容与判据"], [
@@ -679,7 +684,7 @@ tab("cfg_res", "其他控制器配置（独立环境，RP = 2，含异常注入�
 
 h2("波形分析")
 p("全链路波形取自 1024 位、RP = 1 的空载探测；其余取自独立环境（1024 位、RP = 1）。时钟 2ns，蓝色虚线为正文引用的时刻，"
-  "握手类信号画 valid 与 ready 同时为高的周期，脉冲右沿即采样的时钟上升沿，与 GTKWave / Verdi 中的显示一致。"
+  "握手类信号画 valid 与 ready 同时为高的周期，脉冲右沿即采样的时钟上升沿，与 Verdi 中的显示一致。"
   "独立环境的 AXI 输入由测试平台在时钟下降沿驱动，所以 WVALID、RREADY 等会在奇数 ns 处跳变。"
   "全链路两张图的行名对应的信号见{表:wave_sig}（均在 fl_rtl_top 下）。")
 tab("wave_sig", "全链路波形图的行与信号", ["行", "信号（fl_rtl_top.*）"], [
@@ -738,6 +743,78 @@ code("make -C sim run WIDTH=1024 RP=1                    # 独立环境：功能
      "make -C sim run WIDTH=1024 HIF_DRAM_W=64 HIF_LPR=32 # 改 MC 配置：512 位 HIF，LPR credit 32\n"
      "make -C sim run WIDTH=1024 MC_IF=ideal              # 满速 MC 模型，测桥 + 链路上限\n"
      "make -C sim check                                  # 全部独立回归")
+h2("修改仿真配置")
+p("仿真配置全部是 sim/Makefile 中的 make 变量，在命令行上给出即可，不需要修改任何文件；变量改变后自动重新编译。"
+  "下表的默认值是 sim/Makefile 中的取值，与 RTL 参数默认值一致。“环境”一列中“独”为独立环境，“全”为全链路环境。")
+tab("simvars", "仿真配置变量", ["变量", "默认", "对应的参数或含义", "环境"], [
+    ["WIDTH / RP", "256 / 1", "DATA_WIDTH / RP_COUNT（两端）", "独、全"],
+    ["MC_IF", "hif", "存储侧：hif 为 flit2hif_target + HIF 控制器模型；ideal 为满速 MC 模型", "独、全"],
+    ["TX_DEPTH / WR_ROUTE_DEPTH", "2 / 8", "axi2flit_soc 发送队列深度 / 写路由 FIFO 深度", "独、全"],
+    ["RD_OUTSTANDING / WR_OUTSTANDING", "32 / 32", "axi2flit_soc 读、写在途表项数", "独、全"],
+    ["RDATA_DEPTH / WRESP_DEPTH", "32 / 24", "axi2flit_soc 接收深度；RDATA 在 1024 位时默认 24", "独、全"],
+    ["WREQ_DEPTH / RREQ_DEPTH / WDATA_DEPTH", "24 / 32 / 36", "存储侧接收深度；WDATA 在 1024 位时默认 24", "独、全"],
+    ["RESPONSE_DEPTH", "2", "存储侧 RDATA、WRESP 发送队列深度", "独、全"],
+    ["HIF_DRAM_W / HIF_RATIO / HIF_BL", "32 / 4 / 16", "MEMC_DRAM_DATA_WIDTH / MEMC_FREQ_RATIO / MEMC_BURST_LENGTH，"
+     "决定 HIF 数据宽度与行大小", "独、全"],
+    ["HIF_LPR / HIF_HPR / HIF_WR", "24 / 8 / 32", "LPR_CREDITS / HPR_CREDITS / WR_CREDITS，桥与控制器模型同时使用", "独、全"],
+    ["HIF_RD_LINES / HIF_WR_LINES", "32 / 16", "flit2hif_target 的 RD_LINES / WR_LINES", "独、全"],
+    ["HIF_LATENCY", "8", "控制器模型的读延迟（拍）", "独、全"],
+    ["HIF_CREDIT_BITS / HIF_ECC_RMW", "1 / 0", "HIF_CREDIT_BITS / ECC_RMW", "独"],
+    ["LINK_LANES / LINK_BPS", "8 / 2", "链路通道数 / 每符号比特数（2 为 PAM4，1 为 NRZ）", "独、全"],
+    ["LINK_DEPTH", "64", "独立环境链路 FIFO 深度", "独"],
+    ["MC_RD_SLOTS / MC_WR_SLOTS", "16 / 16", "满速 MC 模型的读、写在途数（MC_IF = ideal）", "独"],
+    ["FL_MC_SLOTS / FL_FDI_DEPTH", "16 / 1", "全链路满速 MC 模型在途数 / FDI 接收缓冲深度", "全"],
+    ["JOBS", "2", "Verilator 并行编译数", "独、全"],
+], [5.2, 2.2, 6.6, 1.5])
+p("运行参数决定跑哪些测试，不触发重新编译：")
+tab("simargs", "运行参数", ["变量", "示例", "作用"], [
+    ["ARGS（独立环境）", "ARGS=\"--perf --direction mixed --burst 4\"",
+     "--negative 异常注入；--perf 只测吞吐，配合 --direction read | write | mixed、--burst、--size、--scenario；"
+     "--trace 输出波形；--help 列出全部参数"],
+    ["TC（全链路）", "TC=5,9", "只运行指定用例；1～12 为功能用例，13～15 为满载读 / 写 / 读写同时"],
+    ["FL_ARGS（全链路）", "FL_ARGS=\"--stress --replay --burst 1\"",
+     "--stress 随机背压；--replay 注入 2% CRC 错误触发重传；--burst 满载测试的突发长度；--help 列出全部参数"],
+], [3.4, 5.6, 6.5])
+code("make -C sim run WIDTH=1024 RP=2 HIF_DRAM_W=64 HIF_LATENCY=40      # 512 位 HIF、控制器读延迟 40 拍\n"
+     "make -C sim run WIDTH=256 RDATA_DEPTH=16 ARGS=\"--perf --direction read\"   # 观察接收深度不足时的吞吐\n"
+     "make -C sim fl  WIDTH=256 TC=13,14,15 FL_ARGS=\"--burst 1\"            # 全链路单拍满载\n"
+     "make -C sim help                                                   # 列出全部目标与变量")
+p("注意：（1）独立环境的构建目录只按位宽、RP、存储侧与 HIF 配置区分，深度等变量不同的配置不要并行运行，顺序运行时"
+  "会自动重新编译；（2）生成波形与打开 Verdi 的两条命令必须使用同一组变量，否则设计库与波形的参数不一致；"
+  "（3）要长期改变仿真默认值，修改 sim/Makefile 开头对应的 “变量 ?= 默认值” 一行；交付 RTL 的参数默认值在各顶层模块的 "
+  "parameter 中，两者应保持一致。")
+
+h2("修改验证环境与用例")
+tab("simfiles", "修改内容与对应文件", ["要修改的内容", "文件", "位置与方法"], [
+    ["独立环境的功能用例", "sim/tb/tb_rtl_bridge.cpp", "functional() 函数，按阶段顺序执行；每个阶段以 log.begin(名称, 标签) 开始"],
+    ["独立环境的异常注入", "sim/tb/tb_rtl_bridge.cpp", "negative() 函数：在用例名列表中加名字，在分支中写注入方式，并注明应由哪一端检出"],
+    ["独立环境的吞吐测试", "sim/tb/tb_rtl_bridge.cpp", "performance()、performance_mixed()；运行参数解析在 sc_main()"],
+    ["独立环境的连线与断言", "sim/tb/tb_rtl_bridge.sv", "两端桥、链路 FIFO、控制器模型的例化；SVA 握手保持断言；"
+     "HIF_HPR_QOS、控制器存储容量等固定参数"],
+    ["全链路功能用例", "sim/tb/tb_full_link_rtl.cpp", "functional() 中的 run_case 列表；新用例编号从 16 起，"
+     "并在 case_title() 中补充标题"],
+    ["全链路 RTL 例化", "sim/tb/fl_rtl_top.sv", "两端桥与控制器模型的例化；参数由宏传入，默认值在文件开头的 `ifndef 段"],
+    ["HIF 控制器模型的行为", "sim/model/hif_mc_model.sv", "读延迟、乱序与交织方式、写指针回送顺序、stall 规律、错误注入"],
+    ["满速 MC 模型", "sim/model/flit2mc_target.sv", "仅用于测量桥加链路上限"],
+    ["参考编码与解析", "systemc/include/msg_builder.h、aou_stream_decoder.h", "消息格式变化时与 aou_pkg 同步修改"],
+    ["回归组合", "sim/Makefile", "test-all、hif-cfg-all、check、fl-all 等目标中的配置列表"],
+], [3.6, 4.4, 7.5])
+p("独立环境常用的激励函数（Bench 类）：addr(偏移, 拍数, SIZE, ID, QOS) 构造一笔突发；write(a, 数据种子, 掩码模式) "
+  "完成 AW、全部 W 并等待 B，掩码模式 0 / 1 / 2 分别为全选通、部分选通、全零；read(a) 发 AR 并逐拍核对；"
+  "aw()、w()、ar()、aw_w() 只发不等，用于构造并发；drain() 等待全部完成并清点；block_axi、block_mc、block_link、"
+  "stress 分别制造 AXI、控制器、链路的长时间停顿与随机背压；require(条件, 说明) 添加自定义检查。例如：")
+code("log.begin(\"窄写与高优先级读\", \"narrow write and HPR read\");\n"
+     "auto a = b.addr(32768, 8, 4, 60, 3);   // 偏移 32KB，8 拍，SIZE = 4（16B），ID = 60，QOS = 3（走 HPR）\n"
+     "b.write(a, 0x5A, 1);                   // 部分选通写\n"
+     "b.read(a);                             // 读回并逐字节核对")
+p("全链路用例写在 run_case 中，常用 address(ID, 偏移, 拍数, SIZE)、write_read(a, 数据种子, 掩码模式)、"
+  "send_overlapped(写列表, 种子列表, 读列表, 是否插空拍) 等函数：")
+code("run_case(16, \"8-beat 16B narrow write then read\", [&] {\n"
+     "    write_read(address(16, 0xD000, 8, 4), 0x5A, 1);\n"
+     "});")
+p("修改后先单独运行新用例（make -C sim run 或 make -C sim fl TC=16），再运行 make -C sim check 与 make -C sim fl-all "
+  "确认其余用例不受影响。")
+
 h2("判断结果是否正确")
 li("（1）仿真结束打印报告；出错时打印“RTL FAIL：原因”（独立环境）或“[FAIL] …”与末行“FAIL  N 处错误”（全链路），"
    "make 返回非零。没有这些字样、统计行中“数据错误 0”即为通过。")
@@ -759,8 +836,8 @@ code("make -C sim fsdb  WIDTH=256                      # 独立环境：Verilato
      "make -C sim fl-verdi WIDTH=256                   # 用 Verdi 打开全链路波形")
 p("两种方式都同时加载设计库与 FSDB，可在 Instance 窗口浏览层次、在源码中选中信号按 Ctrl+W 加入波形、"
   "在波形上双击跳变追踪驱动源。独立环境的 RTL 在 TOP.tb_rtl_bridge 下（soc、target 为两端桥），激励由 C++ 产生，"
-  "不在设计库中；全链路的 RTL 在 fl_rtl_top 下，tb_case 信号为当前用例编号（20 为空载延迟测量），"
-  "HIF 信号为 fl_rtl_top.hif_*。")
+  "不在设计库中；全链路的 RTL 在 sc_main.tb.dut 下（即 fl_rtl_top，soc、target 为两端桥），tb_case 信号为当前用例编号"
+  "（20 为空载延迟测量），HIF 信号为 sc_main.tb.dut.hif_*。")
 
 render(FIG_DIR, SPEC_DIR, OUT, ("AXI2FLIT 转接桥", "RTL 设计文档"), "设计说明 · 接口定义 · 性能与验证",
        [("版本", "V2.0"), ("日期", "2026 年 10 月")])

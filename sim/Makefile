@@ -302,14 +302,17 @@ fl-vcs: fl-vcs-build
 # Verdi：用 vericom 把 RTL 编译成 Verdi 设计库（verdi/work.lib++），再加载设计库与 FSDB。
 # 不使用 simv.daidir：它需要 -kdb，而 SystemC 混合仿真的 KDB 要由 Verdi 的 elabcom 补全，
 # 该脚本在 Ubuntu（/bin/sh 为 dash）下无法运行。vericom 同样要用 bash 调用，并需要 -2012 才能识别参数列表中的 localparam。
-# 波形中 RTL 位于 sc_main.tb.dut 之下，tb_case 为当前用例编号（20 为空载延迟测量）。
+# 波形中 RTL 位于 sc_main.tb.dut 之下，设计库用外层顶层 sc_main.tb.dut 对齐该层次；tb_case 为当前用例编号（20 为空载延迟测量）。
 VERDI_DIR = $(FL_VCS_BUILD)/verdi
 VERDI_HOME ?= $(abspath $(dir $(shell command -v verdi))/..)
 fl-verdi:
 	@mkdir -p $(VERDI_DIR)
 	@test -f $(FL_VCS_BUILD)/fl_rtl_top.fsdb || { echo "没有波形，先运行 make fl-vcs WIDTH=$(WIDTH) RP=$(RP) MC_IF=$(MC_IF)"; exit 1; }
-	@cd $(VERDI_DIR) && bash $(VERDI_HOME)/bin/vericom -sv -2012 $(FL_DEFS) $(RTL) $(FL_MODEL) $(FL_TB) > vericom.log 2>&1 || { tail -20 vericom.log; exit 1; }
-	cd $(VERDI_DIR) && verdi -lib work.lib++ -top fl_rtl_top -ssf $(FL_VCS_BUILD)/fl_rtl_top.fsdb &
+	@printf '%s\n' '// 自动生成：与 VCS 波形中的层次 sc_main.tb.dut 一致，Verdi 才能把源码信号对应到 FSDB。' \
+	  'module sc_main; fl_verdi_tb tb(); endmodule' 'module fl_verdi_tb; fl_rtl_top dut(); endmodule' > $(VERDI_DIR)/verdi_top.sv
+	@cd $(VERDI_DIR) && bash $(VERDI_HOME)/bin/vericom -sv -2012 $(FL_DEFS) $(RTL) $(FL_MODEL) $(FL_TB) verdi_top.sv \
+	  > vericom.log 2>&1 || { tail -20 vericom.log; exit 1; }
+	$(if $(NO_GUI),@echo "设计库就绪：$(VERDI_DIR)/work.lib++",cd $(VERDI_DIR) && verdi -lib work.lib++ -top sc_main -ssf $(FL_VCS_BUILD)/fl_rtl_top.fsdb &)
 
 help:
 	@echo '存储侧    ：默认 MC_IF=hif（交付设计）；MC_IF=ideal 为满速 MC 模型，测桥 + 链路上限'
