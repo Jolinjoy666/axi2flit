@@ -20,6 +20,7 @@
 | `ideal-all` | 满速 MC 模型下的吞吐与 90% 门限 |
 | `check` | 以上全部 + FIFO、编解码单元测试 + 记分板自检 |
 | `fl` / `fl-all` / `fl-ideal-all` | 全链路（UCIe 链路模型）：延迟分解、功能用例、满载吞吐 |
+| `sv-vcs`、`sv-verdi` | SV 定向测试平台（`sv_tb/`）：激励与检查均为 SystemVerilog，VCS 仿真、Verdi 看波形，用法见 `sv_tb/README.md` |
 | `fsdb`、`verdi` | 独立环境波形：Verilator 仿真 → FSDB，Verdi 加载设计库与波形（可在源码与波形间跳转） |
 | `fl-vcs`、`fl-verdi` | 全链路波形：VCS 仿真生成 FSDB，Verdi 打开；`fl-wave` 为 Verilator + GTKWave |
 

@@ -199,6 +199,7 @@ SC_MODULE(FullLinkRtlTb) {
     sc_signal<bv<32>> mc_stat_rd{"mc_stat_rd"}, mc_stat_wr{"mc_stat_wr"}, mc_stat_ooo{"mc_stat_ooo"},
                       mc_stat_interleave{"mc_stat_interleave"};
     sc_signal<bv<3>> hif_obs{"hif_obs"};
+    sc_signal<bv<2>> tx_obs{"tx_obs"};      // 组帧器接受消息：bit0 SoC 侧请求，bit1 存储侧响应
 
     Stats stats;
     sc_fifo<FdiFlit> soc_tx, soc_rx, mem_tx, mem_rx;
@@ -254,7 +255,7 @@ SC_MODULE(FullLinkRtlTb) {
         dut.clk(clk); dut.rst_n(rst); dut.link_up(link_up); dut.tb_case(tb_case);
         dut.mc_block(mc_block); dut.mc_stress(mc_stress); dut.mc_model_error(mc_model_error);
         dut.mc_stat_rd(mc_stat_rd); dut.mc_stat_wr(mc_stat_wr); dut.mc_stat_ooo(mc_stat_ooo);
-        dut.mc_stat_interleave(mc_stat_interleave); dut.hif_obs(hif_obs);
+        dut.mc_stat_interleave(mc_stat_interleave); dut.hif_obs(hif_obs); dut.tx_obs(tx_obs);
         dut.s_axi_awvalid(awv); dut.s_axi_awready(awr); dut.s_axi_awaddr(awaddr); dut.s_axi_awid(awid);
         dut.s_axi_awlen(awlen); dut.s_axi_awsize(awsize); dut.s_axi_awburst(awburst); dut.s_axi_awprot(awprot);
         dut.s_axi_awcache(awcache); dut.s_axi_awqos(awqos); dut.s_axi_awlock(awlock); dut.s_axi_awuser(awuser);
@@ -322,25 +323,27 @@ private:
         // 即一直更新第 4 个时间点，直到存储侧送出响应帧。
         if (HIF && probe_step_ == 4) {
             if (hif_obs.read()[w ? 2 : 1].to_bool()) { probe_t_[4] = cycle; probe_seen4_ = true; }
-            if (probe_seen4_ && t_txv.read() && t_txr.read() && has_msg(t_txd.read())) {
-                probe_t_[5] = cycle; probe_step_ = 6;
+            if (probe_seen4_ && tx_obs.read()[1].to_bool()) {
+                probe_t_[5] = cycle + 2; probe_step_ = 6;
             }
             return;
         }
         switch (probe_step_) {
         case 0: ev = w ? wv.read() && wr.read() && wlast.read() : arv.read() && arr.read(); break;   // AXI 请求/最后一拍写数据
-        case 1: ev = s_txv.read() && s_txr.read() && has_msg(s_txd.read()); break;                   // SoC 桥送出帧
+        // 桥发送段的终点：组帧器接受消息后 2 拍（提交到输出寄存器、输出有效）。输出寄存器被链路未取走的
+        // 前一帧占用、或帧有效后等待 FDI ready 的时间属于链路，计入“链路”段。
+        case 1: ev = tx_obs.read()[0].to_bool(); break;                                               // SoC 组帧器接受请求
         case 2: ev = t_rxv.read() && t_rxr.read() && has_msg(t_rxd.read()); break;                   // 存储侧桥收到帧
         // MC 命令握手 / MC 完成握手；HIF 为第一条命令被接收 / 第一行读数据末拍或写数据末拍被接收。
         case 3: ev = HIF ? hif_obs.read()[0].to_bool() : w ? wr_v.read() && wr_r.read() : rd_v.read() && rd_r.read(); break;
         case 4: ev = HIF ? hif_obs.read()[w ? 2 : 1].to_bool()
                          : w ? wrr_v.read() && wrr_r.read() : rdr_v.read() && rdr_r.read(); break;
-        case 5: ev = t_txv.read() && t_txr.read() && has_msg(t_txd.read()); break;                   // 存储侧桥送出响应帧
+        case 5: ev = tx_obs.read()[1].to_bool(); break;                                               // 存储侧组帧器接受响应
         case 6: ev = s_rxv.read() && s_rxr.read() && has_msg(s_rxd.read()); break;                   // SoC 桥收到响应帧
         case 7: ev = w ? bv_.read() && br.read() : rv.read() && rr.read() && rlast.read(); break;    // AXI 响应握手
         }
         if (!ev) return;
-        probe_t_[probe_step_] = cycle;
+        probe_t_[probe_step_] = cycle + (probe_step_ == 1 || probe_step_ == 5 ? 2 : 0);
         probe_step_ = probe_step_ == 7 ? -2 : probe_step_ + 1;
     }
 
@@ -849,7 +852,7 @@ static void report(const FullLinkRtlTb& tb, const Config& cfg, bool stress, bool
         auto row = [&](const char* head, const char* name, const uint64_t* t) {
             auto d = [&](int a, int b) { return 2.0 * double(t[b] - t[a]); };
             // HIF 构建中“控制器”段为第一条命令到最后一行数据末拍（含多行数据的传输）。
-            std::printf("%s%s %3.0f ns = SoC发送 %.0f + 链路 %.0f + 存储侧请求 %.0f + %s %.0f + 存储侧返回 %.0f + 链路 %.0f + SoC接收 %.0f\n",
+            std::printf("%s%s %3.0f ns = SoC发送 %.0f + 链路 %.0f + 存储侧接收 %.0f + %s %.0f + 存储侧发送 %.0f + 链路 %.0f + SoC接收 %.0f\n",
                         head, name, d(0, 7), d(0, 1), d(1, 2), d(2, 3), HIF ? "HIF 控制器" : "MC", d(3, 4), d(4, 5),
                         d(5, 6), d(6, 7));
             soc_lat = std::max(soc_lat, d(0, 1) + d(6, 7));

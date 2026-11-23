@@ -305,8 +305,9 @@ module axi2flit_soc #(
         if (b_locked) begin
             b_sel = int'(b_hold);
         end
-        s_axi_rvalid = r_sel >= 0 && link_up && !protocol_error;
-        s_axi_bvalid = b_sel >= 0 && link_up && !protocol_error;
+        // 已收到的响应在 link_up 为低时照常交给主机，VALID 拉高后保持到握手；只有协议错误后停止输出。
+        s_axi_rvalid = r_sel >= 0 && !protocol_error;
+        s_axi_bvalid = b_sel >= 0 && !protocol_error;
         if (r_sel >= 0) begin
             r_message = rx_data[r_sel][K_RDATA];
             rx_ready[r_sel][K_RDATA] = s_axi_rready && s_axi_rvalid;

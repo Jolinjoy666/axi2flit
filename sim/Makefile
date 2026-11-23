@@ -314,12 +314,41 @@ fl-verdi:
 	  > vericom.log 2>&1 || { tail -20 vericom.log; exit 1; }
 	$(if $(NO_GUI),@echo "设计库就绪：$(VERDI_DIR)/work.lib++",cd $(VERDI_DIR) && verdi -lib work.lib++ -top sc_main -ssf $(FL_VCS_BUILD)/fl_rtl_top.fsdb &)
 
+# ---------------- SV 定向测试平台（VCS + Verdi） ----------------
+# 激励、记分板与用例全部为 SystemVerilog，见 sv_tb/：tb_top.sv（连线）、axi_tasks.svh（主机任务与记分板）、
+# tests.svh（用例）。TEST=all 运行全部用例，TEST=用例名 只运行一个；SEED 为随机用例的种子；SV_ARGS 为其他运行参数。
+#   make sv-vcs WIDTH=256 [TEST=tc_narrow] [SEED=1] [HIF_DRAM_W=..]    make sv-verdi WIDTH=256
+TEST ?= all
+SEED ?= 1
+export PS1 ?= $$     # VCS 脚本以 bash -u 运行，/etc/bash.bashrc 会访问 PS1
+SV_TB := $(ROOT)/sim/sv_tb
+SV_BUILD = $(abspath build/sv_w$(WIDTH)_d$(HIF_DRAM_W)r$(HIF_RATIO)b$(HIF_BL)_lat$(HIF_LATENCY))
+SV_PARAMS = -pvalue+tb_top.DATA_WIDTH=$(WIDTH) -pvalue+tb_top.HIF_DRAM_W=$(HIF_DRAM_W) \
+  -pvalue+tb_top.HIF_RATIO=$(HIF_RATIO) -pvalue+tb_top.HIF_BL=$(HIF_BL) -pvalue+tb_top.HIF_LATENCY=$(HIF_LATENCY)
+.PHONY: sv-build sv-vcs sv-verdi
+sv-build:
+	@mkdir -p $(SV_BUILD)
+	@echo "编译 SV 测试平台（VCS）WIDTH=$(WIDTH)（日志 $(SV_BUILD)/build.log）"
+	@cd $(SV_BUILD) && vcs -full64 -sverilog -timescale=1ns/1ps -debug_access+all -kdb -lca \
+	  +define+FSDB=\"tb_top.fsdb\" +incdir+$(SV_TB) $(SV_PARAMS) \
+	  $(RTL) $(ROOT)/sim/model/hif_mc_model.sv $(SV_TB)/tb_top.sv -top tb_top -o simv > build.log 2>&1 \
+	  || { grep -E "^Error|Error-" -A4 build.log | head -40; exit 1; }
+sv-vcs: sv-build
+	@mkdir -p results
+	@cd $(SV_BUILD) && ./simv +TEST=$(TEST) +SEED=$(SEED) $(SV_ARGS) -no_save > sim.log 2>&1; \
+	  sed -n '/^=\{10,\} SV 测试平台/,$$p' sim.log | grep -vE "^(V C S|           |Synopsys|[$$]finish|Time:|CPU Time|Data structure|\*Verdi\*|FSDB Dumper|\(C\) 1996|(Mon|Tue|Wed|Thu|Fri|Sat|Sun) )" \
+	  | tee $(ROOT)/sim/results/sv_tb_$(WIDTH)_$(TEST).log; grep -q "^SV TB PASS" sim.log
+sv-verdi:
+	@test -f $(SV_BUILD)/tb_top.fsdb || { echo "没有波形，先运行 make sv-vcs WIDTH=$(WIDTH)"; exit 1; }
+	cd $(SV_BUILD) && verdi -dbdir simv.daidir -ssf tb_top.fsdb &
+
 help:
 	@echo '存储侧    ：默认 MC_IF=hif（交付设计）；MC_IF=ideal 为满速 MC 模型，测桥 + 链路上限'
 	@echo '独立 RTL  ：make run WIDTH=1024 RP=1 [RDATA_DEPTH=..] [HIF_DRAM_W=32 HIF_RATIO=4 HIF_BL=16 HIF_LPR/HPR/WR=..]'
 	@echo '           make negative；make check（全部回归）；波形：make fsdb + make verdi；运行参数：make run ARGS=--help'
 	@echo '全链路    ：make fl WIDTH=1024 RP=1 [TC=13] [FL_ARGS=--stress]；make fl-all；make fl-ideal-all'
 	@echo '           make fl-wave TC=2（GTKWave）；make fl-vcs TC=2 + make fl-verdi；用例列表：make fl FL_ARGS=--help'
+	@echo 'SV 测试平台：make sv-vcs WIDTH=256 [TEST=tc_narrow]（VCS）；make sv-verdi（Verdi）；用例见 sv_tb/tests.svh'
 	@echo '单元与其他：make fifo-all / codec-all / lint / hif-cfg-all / ideal-all / perf-all'
 
 .PHONY: codec codec-all

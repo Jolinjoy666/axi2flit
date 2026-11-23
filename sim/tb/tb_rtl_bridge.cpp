@@ -577,7 +577,7 @@ static void report_functional(const Bench& b,const PhaseLog& log,double wall_s,u
         std::snprintf(rbuf,sizeof rbuf,"%llu/%llu",u(x.ar),u(x.r));
         std::printf("%s%s%s%s\n",pad(x.name,28).c_str(),pad(cbuf,8).c_str(),pad(wbuf,12).c_str(),rbuf);
     }
-    std::printf("延迟  SoC 侧 %u ns（发送 %u + 接收 %u），存储侧 %u ns（请求 %u + 返回 %u）\n",
+    std::printf("延迟  SoC 侧 %u ns（发送 %u + 接收 %u），存储侧 %u ns（接收 %u + 发送 %u）\n",
                 b.max_tx+b.max_rx,b.max_tx,b.max_rx,b.max_target+b.max_return,b.max_target,b.max_return);
     for(const auto& p:g_perf) {
         const char* head=&p==&g_perf[0] ? "吞吐  " : "      ";

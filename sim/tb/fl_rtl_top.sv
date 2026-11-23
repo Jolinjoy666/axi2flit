@@ -141,7 +141,9 @@ module fl_rtl_top #(
     output logic mc_model_error,
     output logic [31:0] mc_stat_rd, output logic [31:0] mc_stat_wr, output logic [31:0] mc_stat_ooo,
     output logic [31:0] mc_stat_interleave,
-    output logic [2:0] hif_obs
+    output logic [2:0] hif_obs,
+    // ---- 观察：组帧器接受消息，tx_obs 为 {存储侧 RDATA / WRESP, SoC 侧 RREQ / WDATA} ----
+    output logic [1:0] tx_obs
 );
     import aou_pkg::*;
 
@@ -235,6 +237,16 @@ module fl_rtl_top #(
 
     assign {mc_model_error, mc_stat_rd, mc_stat_wr, mc_stat_ooo, mc_stat_interleave, hif_obs} = '0;
 `endif
+
+    // 桥发送段的终点取“组帧器接受消息后 2 拍”（提交到输出寄存器、输出有效）：输出寄存器被链路未取走的
+    // 前一帧占用时，等待的时间属于链路排队，不计入桥的延迟。
+    always_comb begin
+        tx_obs = '0;
+        for (int p = 0; p < RP_COUNT; p++) begin
+            tx_obs[0] = tx_obs[0] | soc.tx_ready[p][K_RREQ] | soc.tx_ready[p][K_WDATA];
+            tx_obs[1] = tx_obs[1] | target.u_core.tx_ready[p][K_RDATA] | target.u_core.tx_ready[p][K_WRESP];
+        end
+    end
 
     always_comb begin
         dbg_tgt_credit_wait = 0;

@@ -164,10 +164,18 @@ module flit2hif_target #(
     logic [MSG_KIND_COUNT-1:0] reply_valid[RP_COUNT],reply_ready[RP_COUNT];
     msg_t rx_data[RP_COUNT][MSG_KIND_COUNT];
     msg_t reply_data[RP_COUNT][MSG_KIND_COUNT];
-    logic transport_error, local_error, active;
+    logic transport_error, local_error, active, hif_on, rd_go, wr_go;
+    logic cmd_locked, lock_wr;
 
     assign protocol_error = local_error || transport_error;
+    // link_up 为低时只暂停新的工作，已开始的握手照常完成：
+    //   active：接收新请求、生成响应，link_up 为低时暂停；
+    //   hif_on：HIF 读数据、写指针回送（无 ready）与写数据（有 stall），属于已发出命令的收尾，只在协议错误后停止；
+    //   rd_go / wr_go：读、写命令的发起。已呈现但被 stall 的命令（cmd_locked）保持到被接收，之后才暂停。
     assign active = link_up && !protocol_error;
+    assign hif_on = !protocol_error;
+    assign rd_go = !protocol_error && (link_up || (cmd_locked && !lock_wr));
+    assign wr_go = !protocol_error && (link_up || (cmd_locked && lock_wr));
 
     aou_target_core #(
         .DATA_WIDTH(DATA_WIDTH),
@@ -259,7 +267,7 @@ module flit2hif_target #(
         r_last_line = line_of(off_t'(16'(r_req.addr[PAGE_SHIFT-1:0]) + ((16'(r_req.len) + 16'd1) << r_req.size) - 16'd1));
         // 上一个突发的行全部发出后才接收下一个；接收即出队，字段锁存在发起寄存器与上下文中。
         r_start = active && !r_busy && r_sel >= 0 && rc_count < RD_BURSTS;
-        r_want = active && r_busy && rob_count < RD_LINES &&
+        r_want = rd_go && r_busy && rob_count < RD_LINES &&
                  (r_hpr ? hpr_credit != 0 : lpr_credit != 0);
     end
 
@@ -403,7 +411,7 @@ module flit2hif_target #(
         w_sel_req = get_req(rx_data[w_sel < 0 ? 0 : w_sel][K_WREQ]);
 
         // 当前拍：地址、字节通道、本拍需要拆成的行数与本部分所在的行。
-        w_have = active && w_busy && rx_valid[w_rp][K_WDATA];
+        w_have = wr_go && w_busy && rx_valid[w_rp][K_WDATA];
         w_addr = w_off + off_t'(16'(w_beat) << w_size);
         w_bytes = 1 << w_size;
         w_lane = LANE_W'(w_addr % DATA_BYTES);
@@ -498,7 +506,7 @@ module flit2hif_target #(
     // 写数据发送：按指针回送顺序逐行送出 LINE_WORDS 拍。
     always_comb begin
         wd_slot = pull_q[pull_head];
-        hif_wdata_valid = active && pull_count != 0;
+        hif_wdata_valid = hif_on && pull_count != 0;
         hif_wdata = wb_data[wd_slot][int'(pull_word)*CORE_DATA_WIDTH +: CORE_DATA_WIDTH];
         hif_wdata_mask = wb_mask[wd_slot][int'(pull_word)*CORE_MASK_WIDTH +: CORE_MASK_WIDTH];
         hif_wdata_end = int'(pull_word) == LINE_WORDS - 1;
@@ -509,7 +517,7 @@ module flit2hif_target #(
     // ================================================================
     // 命令仲裁：读写共用一个命令口，轮流发出；被 stall 时保持本次选择不变。
     // ================================================================
-    logic grant_wr, last_wr, cmd_locked, lock_wr;
+    logic grant_wr, last_wr;
     always_comb begin
         if (cmd_locked) begin
             grant_wr = lock_wr;
@@ -552,10 +560,11 @@ module flit2hif_target #(
     logic rd_tok_bad, ptr_bad;
     always_comb begin
         rd_tok = RLW'(hif_rdata_token);
-        rd_tok_bad = hif_rdata_valid && (hif_rdata_token >= CORE_TAG_WIDTH'(RD_LINES) ||
+        // 比较时多扩一位：位宽恰为 log2(行数) 时，行数本身不能被截断为 0。
+        rd_tok_bad = hif_rdata_valid && ({1'b0, hif_rdata_token} >= (CORE_TAG_WIDTH+1)'(RD_LINES) ||
                      !rob_busy[rd_tok] || rob_done[rd_tok] ||
                      (hif_rdata_end != (int'(rob_words[rd_tok]) == LINE_WORDS - 1)));
-        ptr_bad = hif_wdata_ptr_valid && (hif_wdata_ptr >= WDATA_PTR_BITS'(WR_LINES) ||
+        ptr_bad = hif_wdata_ptr_valid && ({1'b0, hif_wdata_ptr} >= (WDATA_PTR_BITS+1)'(WR_LINES) ||
                   wb_state[WLW'(hif_wdata_ptr)] != WB_ISSUED);
     end
 
@@ -662,7 +671,7 @@ module flit2hif_target #(
                 end
             end
             // ---- 读数据：按 token 写入行内第 rob_words 拍，可与其他 token 交织 ----
-            if (hif_rdata_valid && active) begin
+            if (hif_rdata_valid && hif_on) begin
                 if (rd_tok_bad) begin
                     local_error <= 1;
                 end else begin
@@ -744,7 +753,7 @@ module flit2hif_target #(
                 free_head <= free_head == WLW'(WR_LINES - 1) ? '0 : free_head + 1'b1;
             end
             // MC 回送指针：可以送这一行的数据了；地址错误记入该突发的状态。
-            if (hif_wdata_ptr_valid && active) begin
+            if (hif_wdata_ptr_valid && hif_on) begin
                 if (ptr_bad) begin
                     local_error <= 1;
                 end else begin
@@ -764,16 +773,16 @@ module flit2hif_target #(
                 pull_head <= pull_head == WLW'(WR_LINES - 1) ? '0 : pull_head + 1'b1;
             end
             free_count <= WLC'(int'(free_count) - ((cmd_accept && grant_wr) ? 1 : 0) + (wd_done ? 1 : 0));
-            pull_count <= WLC'(int'(pull_count) + ((hif_wdata_ptr_valid && active && !ptr_bad) ? 1 : 0) -
+            pull_count <= WLC'(int'(pull_count) + ((hif_wdata_ptr_valid && hif_on && !ptr_bad) ? 1 : 0) -
                                (wd_done ? 1 : 0));
             // 每个突发的状态：本拍选通越界记 SLVERR，MC 回送指针时报地址错误记 DECERR。
             // 待送行数：发命令加一，送完数据减一（可能是不同突发）。
             for (int c = 0; c < WR_BURSTS; c++) begin
                 if ((w_consume && w_beat_bad && w_ctx == WBW'(c)) ||
-                    (hif_wdata_ptr_valid && active && !ptr_bad && hif_wdata_ptr_addr_err &&
+                    (hif_wdata_ptr_valid && hif_on && !ptr_bad && hif_wdata_ptr_addr_err &&
                      wb_ctx[WLW'(hif_wdata_ptr)] == WBW'(c))) begin
                     wctx[c].status <= worse(wctx[c].status,
-                        (hif_wdata_ptr_valid && active && !ptr_bad && hif_wdata_ptr_addr_err &&
+                        (hif_wdata_ptr_valid && hif_on && !ptr_bad && hif_wdata_ptr_addr_err &&
                          wb_ctx[WLW'(hif_wdata_ptr)] == WBW'(c)) ? RESP_DECERR : RESP_SLVERR);
                 end
                 if ((cmd_accept && grant_wr && w_ctx == WBW'(c)) != (wd_done && wb_ctx[wd_slot] == WBW'(c))) begin
