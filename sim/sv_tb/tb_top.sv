@@ -4,14 +4,13 @@
 //   AXI 主机任务 ──AXI──► axi2flit_soc ──Flit──► 链路 FIFO ──► flit2hif_target ──HIF──► hif_mc_model
 //   （axi_tasks.svh）  ◄──R/B──               ◄── 链路 FIFO ◄──                 ◄──      （HIF 控制器模型）
 //
-// 本测试平台全部用 SystemVerilog 编写，用 VCS 仿真、Verdi 看波形：
-//   make -C sim sv-vcs  WIDTH=256              运行全部用例
-//   make -C sim sv-vcs  WIDTH=256 TEST=tc_narrow   只运行一个用例（用例名见 tests.svh）
-//   make -C sim sv-verdi WIDTH=256             打开 Verdi（源码与波形联动）
+// 本测试平台全部用 SystemVerilog 编写，VCS 与 Verilator 均可运行（命令见 sv_tb/README.md）：
+//   make -C sim sv-vcs  WIDTH=256 [TEST=tc_narrow]                     VCS
+//   make -C sim -f Makefile.verilator run WIDTH=256 [TEST=tc_narrow]   Verilator
 //
 // 文件分工：
 //   tb_top.sv      本文件：参数、时钟复位、待测设计连线、背压开关、错误监视、用例调度
-//   axi_tasks.svh  AXI 主机任务（发 AW / W / AR、等待完成）与记分板（参考存储、逐拍核对 R、B）
+//   axi_tasks.svh  AXI 主机：发送队列与驱动器、等待完成、记分板（参考存储、逐拍核对 R、B）
 //   tests.svh      测试用例：每个用例一个 task，开头注释写明测什么、怎么测、波形里看什么
 // ============================================================================
 `timescale 1ns/1ps
@@ -257,7 +256,6 @@ module tb_top #(
         void'($value$plusargs("SEED=%d", seed));
         void'($urandom(seed));
         $timeformat(-9, 0, " ns", 0);          // %t 按 ns 显示
-        axi_idle();
         $display("\n================ SV 测试平台  DATA_WIDTH=%0d  HIF %0d 位、每行 %0dB  TEST=%s ================",
                  DATA_WIDTH, HIF_W, LINE_WORDS * HIF_W / 8, test);
         reset_dut();
@@ -270,10 +268,18 @@ module tb_top #(
         $finish;
     end
 
-`ifdef FSDB
+`ifdef FSDB                                  // VCS：make sv-vcs 定义，生成 FSDB 供 Verdi 查看
     initial begin
         $fsdbDumpfile(`FSDB);
         $fsdbDumpvars(0, tb_top, "+all");
+    end
+`endif
+`ifdef VCD                                   // 用 Verilator 且 WAVE=1 时由 Makefile.verilator 定义，生成 VCD
+    initial begin
+        string vcd = "tb_top.vcd";
+        void'($value$plusargs("VCD=%s", vcd));
+        $dumpfile(vcd);
+        $dumpvars(0, tb_top);
     end
 `endif
 endmodule

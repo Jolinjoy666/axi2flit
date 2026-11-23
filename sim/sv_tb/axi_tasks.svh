@@ -5,7 +5,7 @@
 //   txn_t t = make_txn(地址, 拍数, SIZE, ID);   描述一笔突发；期望响应按地址自动算出
 //   axi_write(t);                               发 AW 与全部 W，等到 B 并核对 BRESP
 //   axi_read(t);                                发 AR，等到最后一拍 R；每拍 R 由监视器自动核对
-//   需要多笔并发时，直接调用 send_aw / send_w / send_ar，再用 wait_done 等待，见 tc_outstanding；
+//   需要多笔并发时，依次调用 send_aw / send_w / send_ar（只入队、立即返回），再用 wait_done 等待，见 tc_outstanding；
 //   这种用法中每笔事务要用 make_txn 新建（编号用来对应发送与完成）。
 //
 // 检查方法（记分板）：
@@ -41,7 +41,6 @@ bit [7:0] ref_mem [longint unsigned];   // 参考存储：只记录写过的字�
 txn_t     wr_exp [int][$];              // 每个 ID 的在途写，按发出顺序
 txn_t     rd_exp [int][$];              // 每个 ID 的在途读，按发出顺序
 int       rd_beat [int];                // 每个 ID 当前读突发已收到的拍数
-txn_t     w_order [$];                  // AW 的发出顺序：W 必须按这个顺序发送
 bit       done [4096];                  // done[seq % 4096] = 1 表示该事务已完成
 int       seq_next = 0;
 
@@ -99,16 +98,7 @@ function automatic bit strobe_on(txn_t t, int n, int j);
     endcase
 endfunction
 
-// ---------------- 复位与空闲 ----------------
-task automatic axi_idle();
-    s_axi_awvalid = 0; s_axi_wvalid = 0; s_axi_arvalid = 0;
-    s_axi_awaddr = 0; s_axi_awid = 0; s_axi_awlen = 0; s_axi_awsize = 0; s_axi_awburst = 2'b01;
-    s_axi_awprot = 0; s_axi_awcache = 0; s_axi_awqos = 0; s_axi_awlock = 0; s_axi_awuser = 0;
-    s_axi_wdata = 0; s_axi_wstrb = 0; s_axi_wlast = 0; s_axi_wuser = 0;
-    s_axi_araddr = 0; s_axi_arid = 0; s_axi_arlen = 0; s_axi_arsize = 0; s_axi_arburst = 2'b01;
-    s_axi_arprot = 0; s_axi_arcache = 0; s_axi_arqos = 0; s_axi_arlock = 0; s_axi_aruser = 0;
-endtask
-
+// ---------------- 复位 ----------------
 // 复位后拉高 link_up，并等两端用只含协议头（PH）的帧交换初始 credit。
 // 这些帧由两端桥自己发出（aou_flit_tx：没有消息但有待归还 credit 时提交只含 PH 的帧），测试平台不需要做任何事；
 // 波形见设计文档“链路 credit 初始化”一节。
@@ -122,83 +112,107 @@ task automatic reset_dut();
 endtask
 
 // ---------------- 通道级任务 ----------------
-// 驱动方式：在时钟上升沿之后用非阻塞赋值给出 VALID 与数据，在之后每个上升沿检查 READY；
-// VALID && READY 的那个上升沿即握手完成。VALID 拉高后一直保持到握手，符合 AXI 规定。
+// send_aw / send_w / send_ar 只把事务放进发送队列，立即返回；真正驱动 AXI 信号的是下面的三个驱动器。
+// W 按 send_w 的调用顺序发送，必须与 send_aw 的顺序一致（AXI 规定写数据按写地址顺序）。
+// 发出后用 wait_done 等待完成。
+txn_t aw_q [$], w_q [$], ar_q [$];   // 待发送的 AW、W、AR（队首为正在发送的一笔）
 
-semaphore aw_lock = new(1);
-semaphore ar_lock = new(1);
-
-// 发一个 AW
 task automatic send_aw(txn_t t);
-    aw_lock.get();
     wr_exp[t.id].push_back(t);      // 记入在途写，供 B 监视器核对
-    w_order.push_back(t);           // 记录 AW 顺序，W 按此顺序发送
-    s_axi_awaddr  <= t.addr;
-    s_axi_awid    <= t.id;
-    s_axi_awlen   <= t.len - 1;
-    s_axi_awsize  <= t.size;
-    s_axi_awburst <= 2'b01;         // INCR
-    s_axi_awqos   <= t.qos;
-    s_axi_awuser  <= 16'(t.seq);
-    s_axi_awvalid <= 1;
-    do @(posedge clk); while (!s_axi_awready);
-    s_axi_awvalid <= 0;
-    aw_lock.put();
+    aw_q.push_back(t);
 endtask
 
-// 发一笔突发的全部 W 拍（等到它在 AW 顺序中排到队首才开始）
 task automatic send_w(txn_t t);
-    wait (w_order.size() > 0 && w_order[0].seq == t.seq);
-    for (int n = 0; n < t.len; n++) begin
-        for (int j = 0; j < BYTES; j++) begin
-            s_axi_wdata[j*8 +: 8] <= pattern(beat_addr(t, n) + j - beat_lane(t, n), t.seed);
-            s_axi_wstrb[j]        <= strobe_on(t, n, j);
-        end
-        s_axi_wlast  <= (n == t.len - 1);
-        s_axi_wuser  <= 16'(n);
-        s_axi_wvalid <= 1;
-        do @(posedge clk); while (!s_axi_wready);
-        // 握手完成：更新参考存储（期望出错的突发不改变存储内容）
-        if (t.resp == OKAY)
-            for (int j = 0; j < BYTES; j++)
-                if (strobe_on(t, n, j))
-                    ref_mem[beat_addr(t, n) + j - beat_lane(t, n)] = pattern(beat_addr(t, n) + j - beat_lane(t, n), t.seed);
-    end
-    s_axi_wvalid <= 0;
-    void'(w_order.pop_front());
+    w_q.push_back(t);
 endtask
 
-// 发一个 AR
 task automatic send_ar(txn_t t);
-    ar_lock.get();
     rd_exp[t.id].push_back(t);      // 记入在途读，供 R 监视器逐拍核对
-    s_axi_araddr  <= t.addr;
-    s_axi_arid    <= t.id;
-    s_axi_arlen   <= t.len - 1;
-    s_axi_arsize  <= t.size;
-    s_axi_arburst <= 2'b01;
-    s_axi_arqos   <= t.qos;
-    s_axi_aruser  <= 16'(t.seq);
-    s_axi_arvalid <= 1;
-    do @(posedge clk); while (!s_axi_arready);
-    s_axi_arvalid <= 0;
-    ar_lock.put();
+    ar_q.push_back(t);
 endtask
 
-// 等待一笔事务完成（写收到 B、读收到 RLAST）；超过 max_cycles 个周期记为失败
-// 外层 fork begin ... end join 把“等待”和“超时”两个进程隔离起来：disable fork 只结束这两个进程，
-// 不会误杀调用者在别处用 fork ... join_none 启动的后台进程（例如 tc_throughput 的计数进程）。
+// ---------------- 驱动器 ----------------
+// AW、W、AR 各由一个 always @(posedge clk) 块驱动，写法与可综合 RTL 相同：
+//   每个上升沿先看本沿是否握手（VALID && READY，读到的是沿前的值），握手则队首出队；
+//   再用非阻塞赋值给出下一拍的 VALID 与内容，队列为空时 VALID 为 0。
+// 这样同一信号只在一个 always 块里赋值，VCS 与 Verilator 的行为一致。
+// （原先在任务中直接用非阻塞赋值驱动，Verilator 5.052 会丢失部分赋值：循环逐字节赋值只剩最后一个字节，
+//  连续两笔之间 VALID 丢失。改为由 always 块驱动后，VCS 与 Verilator 结果一致。）
+always @(posedge clk) begin
+    if (s_axi_awvalid && s_axi_awready) void'(aw_q.pop_front());
+    s_axi_awvalid <= aw_q.size() > 0;
+    if (aw_q.size() > 0) begin
+        s_axi_awaddr <= aw_q[0].addr;
+        s_axi_awid   <= aw_q[0].id;
+        s_axi_awlen  <= aw_q[0].len - 1;
+        s_axi_awsize <= aw_q[0].size;
+        s_axi_awqos  <= aw_q[0].qos;
+        s_axi_awuser <= 16'(aw_q[0].seq);
+    end
+end
+
+always @(posedge clk) begin
+    if (s_axi_arvalid && s_axi_arready) void'(ar_q.pop_front());
+    s_axi_arvalid <= ar_q.size() > 0;
+    if (ar_q.size() > 0) begin
+        s_axi_araddr <= ar_q[0].addr;
+        s_axi_arid   <= ar_q[0].id;
+        s_axi_arlen  <= ar_q[0].len - 1;
+        s_axi_arsize <= ar_q[0].size;
+        s_axi_arqos  <= ar_q[0].qos;
+        s_axi_aruser <= 16'(ar_q[0].seq);
+    end
+end
+
+// W：w_beat 为队首突发正在发送的拍号；握手时更新参考存储（期望出错的突发不改变存储内容）。
+int                    w_beat = 0;
+logic [DATA_WIDTH-1:0] w_data_n;
+logic [BYTES-1:0]      w_strb_n;
+always @(posedge clk) begin
+    if (s_axi_wvalid && s_axi_wready) begin
+        if (w_q[0].resp == OKAY)
+            for (int j = 0; j < BYTES; j++)
+                if (strobe_on(w_q[0], w_beat, j))
+                    ref_mem[beat_addr(w_q[0], w_beat) + j - beat_lane(w_q[0], w_beat)] =
+                        pattern(beat_addr(w_q[0], w_beat) + j - beat_lane(w_q[0], w_beat), w_q[0].seed);
+        if (w_beat == w_q[0].len - 1) begin
+            void'(w_q.pop_front());
+            w_beat = 0;
+        end else begin
+            w_beat++;
+        end
+    end
+    s_axi_wvalid <= w_q.size() > 0;
+    if (w_q.size() > 0) begin
+        // 先在局部变量里拼好整拍，再一次性赋给总线
+        for (int j = 0; j < BYTES; j++) begin
+            w_data_n[j*8 +: 8] = pattern(beat_addr(w_q[0], w_beat) + j - beat_lane(w_q[0], w_beat), w_q[0].seed);
+            w_strb_n[j]        = strobe_on(w_q[0], w_beat, j);
+        end
+        s_axi_wdata <= w_data_n;
+        s_axi_wstrb <= w_strb_n;
+        s_axi_wlast <= w_beat == w_q[0].len - 1;
+        s_axi_wuser <= 16'(w_beat);
+    end
+end
+
+// 其余 AXI 输入为常量
+assign s_axi_awburst = 2'b01;   // INCR
+assign s_axi_arburst = 2'b01;
+assign {s_axi_awprot, s_axi_awcache, s_axi_awlock} = '0;
+assign {s_axi_arprot, s_axi_arcache, s_axi_arlock} = '0;
+
+// 等待一笔事务完成（写收到 B、读收到 RLAST）；超过 max_cycles 个周期记为失败。
+// 逐拍查询完成标志，不用 fork：Verilator 5.052 在 fork 中引用任务参数会崩溃。
 task automatic wait_done(txn_t t, int max_cycles = 20000);
-    fork begin
-        fork
-            wait (done[t.seq % 4096]);
-            begin
-                repeat (max_cycles) @(posedge clk);
-                fail($sformatf("等待事务超时：seq=%0d addr=0x%0h len=%0d id=%0d", t.seq, t.addr, t.len, t.id));
-            end
-        join_any
-        disable fork;
-    end join
+    int k = t.seq % 4096;
+    int n = 0;
+    while (!done[k] && n < max_cycles) begin
+        @(posedge clk);
+        n++;
+    end
+    if (!done[k])
+        fail($sformatf("等待事务超时：seq=%0d addr=0x%0h len=%0d id=%0d", t.seq, t.addr, t.len, t.id));
 endtask
 
 // ---------------- 事务级任务 ----------------
@@ -211,10 +225,8 @@ endfunction
 
 task automatic axi_write(txn_t t);
     t = renew(t);
-    fork
-        send_aw(t);
-        send_w(t);
-    join
+    send_aw(t);
+    send_w(t);
     wait_done(t);
 endtask
 

@@ -1,0 +1,86 @@
+# 用 Verilator 编译并运行 SV 测试平台（sim/sv_tb/），不需要 C++ 测试平台、SystemC、VCS 或 Verdi。
+# 在工程根目录运行：
+#   make -C sim -f Makefile.verilator run WIDTH=256 TEST=tc_single     单个用例
+#   make -C sim -f Makefile.verilator run WIDTH=256                    全部用例
+#   make -C sim -f Makefile.verilator run WIDTH=256 TEST=tc_single WAVE=1   同时生成 VCD 波形
+#   make -C sim -f Makefile.verilator verdi WIDTH=256 TEST=tc_single        用 Verdi 打开上一步的波形（需要 Verdi）
+# 需要 Verilator 5（已在 5.052 上验证）与支持 C++20 协程的编译器（GCC 10 或更新）。
+.DEFAULT_GOAL := run
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
+# 工具与测试参数：编译并行数、AXI 位宽、用例、随机种子、运行超时、是否生成波形。
+VERILATOR ?= verilator
+JOBS ?= 4
+WIDTH ?= 256
+TEST ?= all
+SEED ?= 1
+TIMEOUT ?= 300s
+ARGS ?=
+WAVE ?= 0
+# HIF 参数：DRAM 位宽、频率比、突发长度及模型读延迟。
+HIF_DRAM_W ?= 32
+HIF_RATIO ?= 4
+HIF_BL ?= 16
+HIF_LATENCY ?= 8
+
+# 根据本文件位置确定工程目录、构建目录、日志与波形路径；生成波形的构建单独放一个目录。
+SIM_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+ROOT := $(abspath $(SIM_DIR)/..)
+CONFIG := w$(WIDTH)_d$(HIF_DRAM_W)r$(HIF_RATIO)b$(HIF_BL)_lat$(HIF_LATENCY)
+BUILD := $(SIM_DIR)/build/sv_verilator_$(CONFIG)$(if $(filter 1,$(WAVE)),_wave)
+LOG := $(SIM_DIR)/results/sv_verilator_$(CONFIG)_$(TEST)_seed$(SEED).log
+VCD_FILE := $(SIM_DIR)/results/sv_verilator_$(CONFIG)_$(TEST).vcd
+
+# 待编译的 RTL、控制器模型及 SV 测试顶层。
+RTL := $(addprefix $(ROOT)/rtl/,aou_pkg.sv aou_sync_fifo.sv aou_chunk_fifo.sv \
+       aou_flit_tx.sv aou_flit_rx.sv aou_transport.sv aou_target_core.sv \
+       axi2flit_soc.sv flit2hif_target.sv)
+SOURCES := $(RTL) $(SIM_DIR)/model/hif_mc_model.sv $(SIM_DIR)/sv_tb/tb_top.sv
+# 将位宽及 HIF 配置传给测试顶层参数。
+PARAMS := -GDATA_WIDTH=$(WIDTH) -GHIF_DRAM_W=$(HIF_DRAM_W) \
+          -GHIF_RATIO=$(HIF_RATIO) -GHIF_BL=$(HIF_BL) -GHIF_LATENCY=$(HIF_LATENCY)
+# 仿真选项：时序、断言、输出刷新、告警控制、内联及头文件目录；WAVE=1 时打开 VCD 输出。
+FLAGS := --timing --assert --autoflush --top-module tb_top --timescale 1ns/1ps \
+         --unroll-count 2048 -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-IMPLICITSTATIC \
+         -fno-inline-funcs-eager +incdir+$(SIM_DIR)/sv_tb $(PARAMS) \
+         $(if $(filter 1,$(WAVE)),--trace +define+VCD)
+
+.PHONY: lint build run verdi clean
+# 静态检查源文件，不生成或运行仿真程序。
+lint:
+	@mkdir -p "$(BUILD)"
+	$(VERILATOR) --lint-only $(FLAGS) --Mdir "$(BUILD)" $(SOURCES)
+
+# 编译生成 Vtb_top（约 1～2 分钟），输出写入 build.log；失败时显示日志末尾。
+build:
+	@mkdir -p "$(BUILD)"
+	@echo "编译 SV 测试平台（Verilator）WIDTH=$(WIDTH)（日志 $(BUILD)/build.log）"
+	@$(VERILATOR) --binary -j $(JOBS) $(FLAGS) -Wno-UNOPTFLAT --Mdir "$(BUILD)" \
+	  -CFLAGS '-std=c++20' $(SOURCES) > "$(BUILD)/build.log" 2>&1 \
+	  || { tail -60 "$(BUILD)/build.log"; exit 1; }
+
+# 先编译，再限时运行；保存输出，日志中有 SV TB PASS 才判定通过。
+run: build
+	@mkdir -p "$(SIM_DIR)/results"
+	@timeout -k 5s $(TIMEOUT) "$(BUILD)/Vtb_top" \
+	  +TEST=$(TEST) +SEED=$(SEED) $(if $(filter 1,$(WAVE)),+VCD=$(VCD_FILE)) $(ARGS) 2>&1 | tee "$(LOG)"
+	@$(if $(filter 1,$(WAVE)),echo "波形  $(VCD_FILE)";) grep -qx 'SV TB PASS' "$(LOG)"
+
+# 用 Verdi 查看 WAVE=1 生成的波形（需要 Verdi）：VCD 转为 FSDB，再用 vericom 把同一套源码编译成 Verdi 设计库，
+# 两者层次都是 tb_top，因此可以在层次窗口和源码中选信号加入波形（选中后 Ctrl+W）。
+# 配置变量（WIDTH、TEST、HIF_* 等）须与生成波形时一致。
+VERDI_DIR := $(SIM_DIR)/build/sv_verilator_$(CONFIG)_verdi
+FSDB_FILE := $(VCD_FILE:.vcd=.fsdb)
+verdi:
+	@test -f "$(VCD_FILE)" || { echo "没有波形 $(VCD_FILE)，先运行 make -f Makefile.verilator run WAVE=1 TEST=$(TEST)（配置变量相同）"; exit 1; }
+	@mkdir -p "$(VERDI_DIR)"
+	@echo "转换 FSDB 并编译 Verdi 设计库（日志在 $(VERDI_DIR)）"
+	@cd "$(VERDI_DIR)" && vcd2fsdb "$(VCD_FILE)" -o "$(FSDB_FILE)" > vcd2fsdb.log 2>&1 || { tail -20 vcd2fsdb.log; exit 1; }
+	@cd "$(VERDI_DIR)" && bash "$(VERDI_HOME)/bin/vericom" -sv -2012 +incdir+$(SIM_DIR)/sv_tb +define+VCD \
+	  $(subst -G,-pvalue+tb_top.,$(PARAMS)) $(SOURCES) > vericom.log 2>&1 || { tail -20 vericom.log; exit 1; }
+	$(if $(NO_GUI),@echo "就绪：$(FSDB_FILE)，设计库 $(VERDI_DIR)/work.lib++",cd "$(VERDI_DIR)" && verdi -lib work.lib++ -top tb_top -ssf "$(FSDB_FILE)" &)
+
+# 删除当前配置的构建目录，保留 results 中的日志与波形。
+clean:
+	rm -rf -- "$(BUILD)"
